@@ -1,4 +1,4 @@
-其他依赖：**adb**（任意版本），**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对）。*adb和scrcpy-server注意路径，--help中会有提示*
+其他依赖：**adb**（任意版本）、**scrcpy-server**（v3.3.4，只能这个版本，其他版本协议不对）、**FFmpeg 运行时 DLL**（Windows 运行时必需）。*adb 和 scrcpy-server 注意路径，--help 中会有提示*
 
 <p align="center">
   <img width="220"
@@ -9,6 +9,55 @@
 </p>
 
 
+
+## 当前运行模式（重要）
+
+当前仓库代码已升级为 **Rust 动态库（cdylib）+ FFI API** 主链路：
+
+- 对外 API：`src/rust_scrcpy_api.rs`
+- 服务层：`src/rust_scrcpy_api/service.rs`
+- 运行时：`src/rust_scrcpy_api/runtime.rs`
+- 会话建链：`src/session/manager.rs`
+- scrcpy 服务控制：`src/scrcpy/server.rs`
+- 解码链路：`src/decoder/ffmpeg_decoder.rs`、`src/decoder/pipeline.rs`
+
+> 下文原有 scrcpy 协议参数、优化配置、端口机制等章节继续保留，作为协议与调优参考。
+
+## 安装与运行（Rust 侧）
+
+### 1) 必需文件
+
+- `adb` 可执行文件
+- `scrcpy-server-v3.3.4`
+- Windows 下 FFmpeg DLL：
+  - `avcodec-62.dll`
+  - `avformat-62.dll`
+  - `avutil-60.dll`
+  - `swresample-6.dll`
+  - `swscale-9.dll`
+
+DLL 放置位置（任选其一）：
+
+1. 与最终可执行文件同目录
+2. 与 `rust_scrcpy.dll` 同目录
+3. 系统 `PATH` 目录
+
+### 2) 构建命令（Rust）
+
+```bash
+cargo build --release --lib --features frb
+```
+
+### 3) 典型调用执行流程（当前代码）
+
+1. `setup_logger(max_level)`
+2. `list_devices(adb_path)`
+3. `create_session_v2(config)`（或 `create_session`）
+4. `start_session(session_id)`
+5. 运行期控制：`send_touch/send_key/send_scroll/send_text/send_system_key/set_clipboard/set_orientation_mode/request_idr`
+6. `get_session_stats(session_id)`
+7. `stop_session(session_id)`
+8. `dispose_session(session_id)`
 
 ## 目录
 
@@ -26,42 +75,38 @@
    - [7.11 剪贴板粘贴功能](#711-剪贴板粘贴功能)
    - [7.12 鼠标滚轮支持](#712-鼠标滚轮支持)
    - [7.5 屏幕旋转自动适配](#75-屏幕旋转自动适配)
-8. [WebSocket通信](#8-websocket通信)
-9. [前端解码与渲染](#9-前端解码与渲染)
-10. [数据流转图](#10-数据流转图)
-11. [关键技术细节](#11-关键技术细节)
-12. [配置参数说明](#12-配置参数说明)
-13. [错误处理](#13-错误处理)
-14. [端口自动寻找机制](#14-端口自动寻找机制)
-
+8. [解码与渲染链路](#9-解码与渲染链路当前实现)
+9. [数据流转图](#10-数据流转图)
+10. [关键技术细节](#11-关键技术细节)
+11. [配置参数说明](#12-配置参数说明)
+12. [错误处理](#13-错误处理)
+13. [端口自动寻找机制](#14-端口自动寻找机制)
 ---
 
 ## 1. 系统概述
 
-Rust-Scrcpy 是一个用 Rust 实现的 Android 屏幕镜像系统，通过 ADB 与设备通信，使用 scrcpy-server 捕获屏幕，并通过 WebSocket 将 H.264 视频流广播到浏览器客户端。同时支持双向控制，允许用户通过浏览器触控/鼠标操作远程控制 Android 设备。
+Rust-Scrcpy 是一个用 Rust 实现的 Android 屏幕镜像系统，通过 ADB 与设备通信，使用 scrcpy-server 捕获屏幕，并通过 ADB 与设备通信，拉起 scrcpy-server 传输视频与控制流，并通过 FFI 向上层应用暴露会话与控制能力。
 
 ### 核心特性
 
 - **实时屏幕镜像**: 低延迟 H.264 视频流传输
-- **多解码器支持**: WebCodecs（硬件加速）、JMuxer（MSE）、Broadway（软解码）自动降级
+- **解码策略**: FFmpeg 硬解优先，可按策略强制硬解/软解
 - **双向控制**: 支持触摸、鼠标、按键事件（仅单点控制）
 - **键盘输入**: 支持字母、数字、功能键、方向键等
 - **剪贴板粘贴**: 支持 Ctrl+V 快速粘贴文本到手机
 - **鼠标滚轮**: 支持滚轮滚动，方便浏览网页和列表
 - **屏幕旋转适配**: 自动检测横竖屏切换并调整显示
-- **Web 客户端**: 多解码器自动降级，兼容所有现代浏览器
-- **多客户端支持**: 使用 broadcast channel 同时向多个客户端推流
 - **自动 IDR 帧请求**: 新客户端连接时自动获取关键帧，提高画面响应速度
 - **自动端口**：自动跳过占用的端口，使用未被占用的端口
 
 ### 技术栈
 
 | 组件           | 技术                                                  |
-| -------------- | ----------------------------------------------------- |
-| 后端运行时     | Tokio (异步)                                          |
-| HTTP/WebSocket | Axum                                                  |
+| -------------- | -----------------------------------------------------|
+| 后端运行时     | Tokio (异步)                                           |
+| API 边界       | FFI (rust_scrcpy_api)                                |
 | 视频编码       | H.264 (Android MediaCodec)                            |
-| 前端解码       | WebCodecs / JMuxer (MSE) / Broadway.js（自动降级）    |
+| 解码实现       | ffmpeg-next（硬解优先，失败回退软解）                     |
 | 进程通信       | ADB forward + TCP                                     |
 
 ---
@@ -70,249 +115,146 @@ Rust-Scrcpy 是一个用 Rust 实现的 Android 屏幕镜像系统，通过 ADB 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              Rust-Scrcpy 系统架构                        │
+│                       rust-ws-scrcpy 当前架构（库模式）                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  ┌──────────────┐     ADB      ┌──────────────────────────────────────┐ │
-│  │              │◄────────────►│            Android Device            │ │
-│  │   AdbClient  │   (USB/WiFi) │  ┌─────────────────────────────────┐ │ │
-│  │              │              │  │       scrcpy-server.jar         │ │ │
-│  └──────┬───────┘              │  │  ┌───────────┐  ┌────────────┐  │ │ │
-│         │                      │  │  │  Video    │  │  Control   │  │ │ │
-│         │                      │  │  │  Encoder  │  │  Handler   │  │ │ │
-│         │                      │  │  └─────┬─────┘  └──────┬─────┘  │ │ │
-│         │                      │  └────────┼───────────────┼────────┘ │ │
-│         │                      └───────────┼───────────────┼──────────┘ │
-│         │                                  │               │            │
-│         │ adb forward                      │               │            │
-│         │ tcp:27183 → localabstract:scrcpy │               │            │
-│         │ tcp:27184 → localabstract:scrcpy │               │            │
-│         │                                  │               │            │
-│  ┌──────▼───────┐              ┌───────────▼───────────────▼──────────┐ │
-│  │              │              │                                      │ │
-│  │ ScrcpyServer │◄────────────►│            TCP Streams               │ │
-│  │              │   TCP:27183  │  ┌────────────┐    ┌──────────────┐  │ │
-│  └──────────────┘   TCP:27184  │  │ Video Port │    │ Control Port │  │ │
-│                                │  │   27183    │    │    27184     │  │ │
-│                                │  └──────┬─────┘    └──────┬───────┘  │ │
-│                                └─────────┼─────────────────┼──────────┘ │
-│                                          │                 │            │
-│                                          ▼                 ▼            │
-│                           ┌────────────────────┐  ┌──────────────────┐  │
-│                           │ VideoStreamReader  │  │  ControlChannel  │  │
-│                           │ (NAL 解析器)        │  │  (事件发送器)    │  │
-│                           └─────────┬──────────┘  └────────┬─────────┘  │
-│                                     │                      │            │
-│                                     │ Bytes (NAL Units)    │ TouchEvent │
-│                                     ▼                      ▼            │
-│                           ┌─────────────────────────────────────────┐   │
-│                           │           Main Event Loop               │   │
-│                           │  ┌─────────────────────────────────┐    │   │
-│                           │  │     tokio::select! {            │    │   │
-│                           │  │       video_frame => broadcast, │    │   │
-│                           │  │       control_event => send,    │    │   │
-│                           │  │       idr_request => cache_send │    │   │
-│                           │  │     }                           │    │   │
-│                           │  └─────────────────────────────────┘    │   │
-│                           └──────────────────┬──────────────────────┘   │
-│                                              │                          │
-│                                              │ broadcast::Sender<Bytes> │
-│                                              ▼                          │
-│                           ┌─────────────────────────────────────────┐   │
-│                           │          WebSocketServer                │   │
-│                           │  ┌─────────────────────────────────┐    │   │
-│                           │  │     HTTP: /     → HTML页面      │    │   │
-│                           │  │     WS:   /ws   → 视频流+控制    │    │   │
-│                           │  └─────────────────────────────────┘    │   │
-│                           └──────────────────┬──────────────────────┘   │
-│                                              │                          │
-│                                              │ WebSocket (Binary+Text)  │
-│                                              ▼                          │
-│                           ┌─────────────────────────────────────────┐   │
-│                           │            Browser Client               │   │
-│                           │  ┌─────────────────────────────────┐    │   │
-│                           │  │  WebCodecs VideoDecoder         │    │   │
-│                           │  │  Canvas 2D Rendering            │    │   │
-│                           │  │  Touch/Mouse Event Handlers     │    │   │
-│                           │  └─────────────────────────────────┘    │   │
-│                           └─────────────────────────────────────────┘   │
+│  ┌──────────────────────────────┐                                       │
+│  │   Upper App (FFI Caller)     │                                       │
+│  │  - setup_logger              │                                       │
+│  │  - create/start/stop session │                                       │
+│  │  - send_* controls           │                                       │
+│  └──────────────┬───────────────┘                                       │
+│                 │                                                       │
+│                 ▼                                                       │
+│  ┌──────────────────────────────┐                                       │
+│  │ rust_scrcpy_api (Facade)     │                                       │
+│  │  src/rust_scrcpy_api.rs      │                                       │
+│  └──────────────┬───────────────┘                                       │
+│                 │                                                       │
+│                 ▼                                                       │
+│  ┌──────────────────────────────┐                                       │
+│  │ service + runtime            │                                       │
+│  │  service.rs / runtime.rs     │                                       │
+│  │  RealSessionRuntime::start() │                                       │
+│  └──────────────┬───────────────┘                                       │
+│                 │                                                       │
+│                 ▼                                                       │
+│  ┌──────────────────────────────┐                                       │
+│  │ SessionManager::connect_v2   │                                       │
+│  │  - ScrcpyServer.deploy/start │                                       │
+│  │  - connect video/control     │                                       │
+│  └──────────────┬───────────────┘                                       │
+│                 │ adb push / adb forward / adb shell                    │
+│                 ▼                                                       │
+│  ┌──────────────────────────────┐                                       │
+│  │ Android Device               │                                       │
+│  │  scrcpy-server v3.3.4        │                                       │
+│  │  video socket + control      │                                       │
+│  └──────────────┬───────────────┘                                       │
+│                 │                                                       │
+│                 ▼                                                       │
+│  ┌──────────────────────────────┐                                       │
+│  │ FramedVideoStreamReader      │                                       │
+│  │ DecoderPipeline (FFmpeg)     │                                       │
+│  │ ControlChannel               │                                       │
+│  └──────────────────────────────┘                                       │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
-
 ## 3. 启动流程
 
-### 3.1 完整启动时序图
+### 3.1 完整启动时序图（当前实现）
 
 ```
-┌────────┐     ┌─────────┐     ┌──────────────┐     ┌─────────────────┐     ┌────────┐
-│  User  │     │  Main   │     │  AdbClient   │     │  ScrcpyServer   │     │ Device │
-└───┬────┘     └────┬────┘     └──────┬───────┘     └────────┬────────┘     └───┬────┘
-    │               │                 │                      │                  │
-    │ cargo run     │                 │                      │                  │
-    │──────────────>│                 │                      │                  │
-    │               │                 │                      │                  │
-    │               │ list_devices()  │                      │                  │
-    │               │────────────────>│                      │                  │
-    │               │                 │    adb devices       │                  │
-    │               │                 │─────────────────────────────────────────>
-    │               │                 │                      │                  │
-    │               │                 │<─────────────────────────────────────────
-    │               │<────────────────│                      │                  │
-    │               │                 │                      │                  │
-    │               │ shell("wm size")│                      │                  │
-    │               │────────────────>│                      │                  │
-    │               │                 │─────────────────────────────────────────>
-    │               │<────────────────│   "Physical size: 1080x1920"            │
-    │               │                 │                      │                  │
-    │               │ deploy()        │                      │                  │
-    │               │────────────────────────────────────────>                  │
-    │               │                 │    adb push          │                  │
-    │               │                 │────────────────────────────────────────>│
-    │               │                 │                      │                  │
-    │               │ start()         │                      │                  │
-    │               │────────────────────────────────────────>                  │
-    │               │                 │                      │                  │
-    │               │                 │  adb forward tcp:27183→localabstract:scrcpy
-    │               │                 │────────────────────────────────────────>│
-    │               │                 │  adb forward tcp:27184→localabstract:scrcpy
-    │               │                 │────────────────────────────────────────>│
-    │               │                 │                      │                  │
-    │               │                 │  adb shell CLASSPATH=... app_process ...│
-    │               │                 │────────────────────────────────────────>│
-    │               │                 │                      │    [server启动]   │
-    │               │                 │                      │                  │
-    │               │ connect_video() │                      │                  │
-    │               │────────────────────────────────────────>                  │
-    │               │                 │  TCP connect 127.0.0.1:27183            │
-    │               │                 │<───────────────────────────────────────>│
-    │               │                 │                      │                  │
-    │               │ connect_control()                      │                  │
-    │               │────────────────────────────────────────>                  │
-    │               │                 │  TCP connect 127.0.0.1:27184            │
-    │               │                 │<───────────────────────────────────────>│
-    │               │                 │                      │                  │
-    │               │ read_video_header()                    │                  │
-    │               │────────────────────────────────────────>                  │
-    │               │                 │                      │    dummy byte    │
-    │               │                 │<────────────────────────────────────────│
-    │               │                 │                      │                  │
-    │               │ [进入主事件循环]  │                      │                  │
-    │               │                 │                      │   H.264 NAL流    │
-    │               │                 │<────────────────────────────────────────│
-    │               │                 │                      │                  │
+┌────────────┐  ┌───────────────────────┐  ┌────────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Upper App  │  │ rust_scrcpy_api       │  │ SessionRuntime │  │ ScrcpyServer │  │ AndroidDevice│
+└─────┬──────┘  └──────────┬────────────┘  └───────┬────────┘  └──────┬───────┘  └──────┬───────┘
+      │ setup_logger()               │                     │                 │                 │
+      │──────────────────────────────>│                     │                 │                 │
+      │ list_devices(adb_path)        │                     │                 │                 │
+      │──────────────────────────────>│                     │                 │                 │
+      │<──────────────────────────────│                     │                 │                 │
+      │ create_session_v2(config)     │                     │                 │                 │
+      │──────────────────────────────>│                     │                 │                 │
+      │ start_session(session_id)      │                    │                 │                 │
+      │──────────────────────────────>│  start()            │                 │                 │
+      │                               │────────────────────>│ connect_v2()    │                 │
+      │                               │                     │────────────────>│ deploy/start     │
+      │                               │                     │                 │────────────────>│
+      │                               │                     │                 │ adb push/forward │
+      │                               │                     │                 │ adb shell server │
+      │                               │                     │ connect video/control             │
+      │                               │                     │────────────────>│                 │
+      │                               │                     │ read_video_header(dummy/meta)    │
+      │                               │                     │────────────────>│                 │
+      │                               │                     │ start decoder/control loop        │
+      │ send_touch/send_key/...       │                     │                 │                 │
+      │──────────────────────────────>│────────────────────>│────────────────>│────────────────>│
+      │ request_idr()                 │────────────────────>│────────────────>│────────────────>│
+      │ get_session_stats()           │────────────────────>│                 │                 │
+      │<──────────────────────────────│                     │                 │                 │
+      │ stop_session()/dispose_session│                     │                 │                 │
+      │──────────────────────────────>│────────────────────>│ stop()          │ stop + cleanup  │
 ```
-
-### 3.2 启动代码流程
+### 3.2 启动代码流程（当前 API 路径）
 
 ```rust
-// src/main.rs - 简化的启动流程
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1. 解析命令行参数
-    let args = Args::parse();
+// 伪代码：src/rust_scrcpy_api.rs 对外调用顺序
+async fn start_flow(adb_path: String, config: SessionConfigV2) -> Result<()> {
+    setup_logger(LogLevel::Info).await?;
 
-    // 2. 初始化日志系统
-    tracing_subscriber::fmt().with_max_level(log_level).init();
-
-    // 3. 创建 ADB 客户端
-    let adb = AdbClient::new(args.adb_path);
-
-    // 4. 获取设备列表并选择设备
-    let devices = adb.list_devices().await?;
-    let device_id = devices[0].clone();
-
-    // 5. 获取设备物理屏幕尺寸
-    let wm_size_output = adb.shell(&device_id, "wm size").await?;
-    let (device_width, device_height) = parse_wm_size(&wm_size_output)?;
-
-    // 6. 创建并配置 ScrcpyServer
-    let mut server = ScrcpyServer::with_config(adb, device_id, ...);
-
-    // 7. 部署 server 到设备
-    server.deploy().await?;
-
-    // 8. 启动 server (设置端口转发并执行)
-    server.start().await?;
-
-    // 9. 连接视频流和控制流
-    let video_stream = server.connect_video().await?;
-    let control_stream = server.connect_control().await?;
-
-    // 10. 读取协议头 (dummy byte)
-    let codec_info = ScrcpyServer::read_video_header(&mut video_stream).await?;
-
-    // 11. 创建通道
-    let (idr_request_tx, idr_request_rx) = mpsc::channel(10);
-    let (control_tx, control_rx) = mpsc::channel(100);
-
-    // 12. 创建并启动 WebSocket 服务器
-    let ws_server = WebSocketServer::new(ws_port, idr_request_tx, control_tx, ...);
-    tokio::spawn(async move { ws_server.start().await });
-
-    // 13. 进入主事件循环
-    loop {
-        tokio::select! {
-            Some(control_event) = control_rx.recv() => { /* 处理控制事件 */ }
-            Some(_) = idr_request_rx.recv() => { /* 处理IDR请求 */ }
-            frame_result = reader.read_frame(false) => { /* 处理视频帧 */ }
-        }
+    let devices = list_devices(adb_path).await?;
+    if devices.is_empty() {
+        return Err(ScrcpyError::DeviceNotFound);
     }
+
+    let session_id = create_session_v2(config).await?;
+    start_session(session_id.clone()).await?;
+
+    // 运行期控制
+    // send_touch(...).await?;
+    // send_key(...).await?;
+    // request_idr(session_id.clone()).await?;
+
+    let _stats = get_session_stats(session_id.clone()).await?;
+
+    stop_session(session_id.clone()).await?;
+    dispose_session(session_id).await?;
+    Ok(())
 }
 ```
 
 ---
-
-### 3.3 WiFi启动
+### 3.3 ADB WiFi 连接（通用）
 
 步骤：
 
-1.**首次设置（需要 USB）**
-
-先用 USB 连接手机，然后开启 TCP/IP 模式
+1. **首次设置（需要 USB）**
 
 ```bash
 adb tcpip 5555
 ```
 
-查看手机 IP 地址（在手机 设置 > 关于手机 > 状态 中查看）
-或者用命令：
+2. 查询手机 IP：
 
 ```bash
-adb shell ip route | findstr wlan     // powershell
+adb shell ip route | findstr wlan
 ```
 
-2.**WiFi 连接**
+3. WiFi 连接：
 
-拔掉 USB，通过 WiFi 连接
 ```bash
 adb connect 192.168.1.xxx:5555
-```
-
-确认连接成功
-
-```bash
 adb devices
 ```
-3.**运行 rust-scrcpy**
 
-直接运行，会自动识别 WiFi 连接的设备，注意使用 `--public` 参数
-```bash    
-rust-ws-scrcpy.exe --public
-```
-
-或者指定设备
-
-```bash
-rust-ws-scrcpy.exe -d 192.168.1.xxx:5555 --public
-```
 **注意事项：**
-  - 手机和电脑需要在同一局域网
-  - WiFi 连接延迟会比 USB 稍高（通常增加 20-50ms）
-  - 某些手机重启后需要重新开启 adb tcpip 5555
-  - 部分 Android 11+ 设备支持无线调试，可在开发者选项中直接开启，无需 USB
+
+- 手机和电脑需要在同一局域网。
+- WiFi 连接延迟通常高于 USB。
+- 某些手机重启后需要重新执行 `adb tcpip 5555`。
 
 ## 4. ADB通信层
 
@@ -958,568 +900,204 @@ pub struct ScrollEvent {
 
 ### 7.5.1 功能概述
 
-当手机屏幕旋转（如播放视频全屏）时，系统会自动检测分辨率变化并通知前端调整 canvas 布局。
+当前实现在运行时处理分辨率/方向变化，并通过会话事件通知上层更新渲染与触控映射。
 
 ### 7.5.2 后端检测机制
 
 ```rust
-// src/main.rs - SPS 解析时检测旋转
-if let Some((width, height)) = parse_sps_resolution(&frame.data) {
-    let new_is_landscape = width > height;
-    let resolution_changed = config.width != width || config.height != height;
-    let orientation_changed = config.is_landscape != new_is_landscape;
-
-    if resolution_changed || orientation_changed {
-        config.width = width;
-        config.height = height;
-        config.is_landscape = new_is_landscape;
-
-        // 广播配置更新给所有客户端
-        let config_msg = format!(
-            r#"{{"type":"config","width":{},"height":{},"is_landscape":{}}}"#,
-            width, height, new_is_landscape
-        );
-        config_sender.send(config_msg);
-    }
+// runtime.rs（简化）
+if (width, height) != last_size || frame_generation != active_generation {
+    active_generation = frame_generation;
+    Self::push_event(
+        &session_id,
+        &events,
+        SessionEvent::ResolutionChanged {
+            width,
+            height,
+            new_handle: handle,
+            generation: frame_generation,
+        },
+    );
+    last_size = (width, height);
 }
 ```
 
-### 7.5.3 VideoConfig 结构
+### 7.5.3 事件结构
 
 ```rust
-// src/ws/server.rs
-pub struct VideoConfig {
-    pub sps: Option<Bytes>,
-    pub pps: Option<Bytes>,
-    pub width: u32,           // 视频流分辨率
-    pub height: u32,
-    pub device_width: u32,    // 设备物理分辨率
-    pub device_height: u32,
-    pub is_landscape: bool,   // 是否为横屏模式
+pub enum SessionEvent {
+    // ...
+    ResolutionChanged {
+        width: u32,
+        height: u32,
+        new_handle: i64,
+        generation: u64,
+    },
 }
 ```
 
-### 7.5.4 前端自适应布局
+### 7.5.4 上层处理建议
 
-```javascript
-let isLandscape = false;
-
-function resizeCanvas() {
-    if (videoWidth > 0 && videoHeight > 0) {
-        const videoRatio = videoWidth / videoHeight;
-        const windowRatio = window.innerWidth / window.innerHeight;
-
-        // 根据视频和窗口的宽高比来决定如何适配
-        if (videoRatio > windowRatio) {
-            // 横屏视频在窄窗口，按宽度填满
-            canvas.style.width = '100vw';
-            canvas.style.height = `${window.innerWidth / videoRatio}px`;
-        } else {
-            // 竖屏视频，按高度填满
-            canvas.style.height = '100vh';
-            canvas.style.width = `${window.innerHeight * videoRatio}px`;
-        }
-    }
-}
-
-// 处理配置消息
-ws.onmessage = (event) => {
-    if (typeof event.data === 'string') {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'config') {
-            videoWidth = msg.width;
-            videoHeight = msg.height;
-            isLandscape = msg.is_landscape || false;
-
-            canvas.width = msg.width;
-            canvas.height = msg.height;
-            resizeCanvas();  // 重新调整布局
-        }
-    }
-};
-```
+- 收到 `ResolutionChanged` 后立即更新渲染目标尺寸。
+- 触控映射使用当前视频尺寸，避免旋转后坐标偏移。
+- 代际（generation）变化时丢弃旧帧，优先渲染新代际最新帧。
 
 ### 7.5.5 配置变化广播机制
 
-```rust
-// src/ws/server.rs - 添加配置广播通道
-pub struct WebSocketServer {
-    tx: broadcast::Sender<Bytes>,           // 视频帧广播
-    config_tx: broadcast::Sender<String>,   // 配置变化广播
-    // ...
-}
+当前实现已从旧配置广播机制调整为 **会话事件回调**：
 
-// handle_client 中监听配置变化
-loop {
-    tokio::select! {
-        // 接收配置变化并发送给客户端
-        config_result = config_rx.recv() => {
-            if let Ok(config_msg) = config_result {
-                socket.send(Message::Text(config_msg)).await;
-            }
-        }
-
-        // 接收视频帧并发送
-        frame_result = rx.recv() => { /* ... */ }
-
-        // 监听客户端消息
-        msg = socket.recv() => { /* ... */ }
-    }
-}
-```
-
----
-
-## 8. WebSocket通信
-
-### 8.1 WebSocket 服务器架构
+- Rust runtime 在分辨率/方向变化时产出 `SessionEvent::ResolutionChanged`。
+- 事件通过 `flutter_callback_register::notify_session_event(...)` 推送给上层。
+- 上层收到事件后更新渲染尺寸与触控映射基准。
 
 ```rust
-// src/ws/server.rs
-pub struct WebSocketServer {
-    addr: SocketAddr,
-    tx: broadcast::Sender<Bytes>,           // 视频帧广播通道
-    video_config: Arc<RwLock<VideoConfig>>, // SPS/PPS 缓存
-    idr_request_tx: mpsc::Sender<()>,       // IDR 请求通道
-    control_tx: mpsc::Sender<TouchEvent>,   // 控制事件通道
-}
-
-pub struct VideoConfig {
-    pub sps: Option<Bytes>,       // 缓存的 SPS
-    pub pps: Option<Bytes>,       // 缓存的 PPS
-    pub width: u32,               // 视频流分辨率
-    pub height: u32,
-    pub device_width: u32,        // 设备物理分辨率 (用于触控)
-    pub device_height: u32,
-}
-```
-
-### 8.2 WebSocket 消息协议
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     WebSocket Message Protocol                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  服务器 → 客户端:                                                        │
-│  ────────────────                                                       │
-│                                                                         │
-│  1. 配置消息 (Text/JSON):                                                │
-│     {                                                                   │
-│       "type": "config",                                                 │
-│       "width": 1920,          ← 视频流分辨率 (用于canvas)                │
-│       "height": 1080,                                                   │
-│       "device_width": 1080,   ← 设备物理分辨率 (用于触控)                 │
-│       "device_height": 1920                                             │
-│     }                                                                   │
-│                                                                         │
-│  2. 视频帧 (Binary):                                                    │
-│     [00 00 00 01] [NAL Unit Data]                                       │
-│     └───起始码───┘ └──H.264 数据──┘                                       │
-│                                                                         │
-│                                                                         │
-│  客户端 → 服务器:                                                        │
-│  ────────────────                                                       │
-│                                                                         │
-│  1. 触控事件 (Text/JSON):                                                │
-│     {                                                                   │
-│       "action": 0,            ← 0=Down, 1=Up, 2=Move                    │
-│       "pointer_id": -1,       ← -1=鼠标, >=0=触摸                        │
-│       "x": 0.5,               ← 归一化坐标 [0, 1]                        │
-│       "y": 0.3,               ← 归一化坐标 [0, 1]                        │
-│       "pressure": 1.0,        ← 压力 [0, 1]                             │
-│       "width": 1920,          ← 视频流宽度                               │
-│       "height": 1080,         ← 视频流高度                               │
-│       "buttons": 1            ← 按钮状态                                 │
-│     }                                                                   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### 8.3 客户端连接处理流程
-
-```rust
-async fn handle_client(
-    mut socket: WebSocket,
-    tx: broadcast::Sender<Bytes>,
-    video_config: Arc<RwLock<VideoConfig>>,
-    idr_request_tx: mpsc::Sender<()>,
-    control_tx: mpsc::Sender<TouchEvent>,
-) {
-    // 1. 请求 IDR 帧 (确保新客户端能立即解码)
-    idr_request_tx.send(()).await;
-
-    // 2. 发送配置信息
-    let config = video_config.read().await;
-    let config_msg = format!(r#"{{"type":"config","width":{},"height":{},...}}"#, ...);
-    socket.send(Message::Text(config_msg)).await;
-
-    // 3. 发送缓存的 SPS/PPS
-    if let Some(sps) = &config.sps {
-        socket.send(Message::Binary(sps.to_vec())).await;
-    }
-    if let Some(pps) = &config.pps {
-        socket.send(Message::Binary(pps.to_vec())).await;
-    }
-
-    // 4. 订阅视频帧广播
-    let mut rx = tx.subscribe();
-
-    // 5. 主循环: 转发视频帧 + 处理控制事件
-    loop {
-        tokio::select! {
-            // 接收视频帧并转发
-            frame_result = rx.recv() => {
-                match frame_result {
-                    Ok(frame) => socket.send(Message::Binary(frame.to_vec())).await,
-                    Err(Lagged(_)) => {
-                        // 追帧: 丢弃积压的旧帧,跳到最新
-                        while let Ok(latest) = rx.try_recv() {
-                            socket.send(Message::Binary(latest.to_vec())).await;
-                        }
-                    }
-                }
-            }
-
-            // 接收客户端消息
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        // 解析触控事件并转发
-                        let touch_event: TouchEvent = serde_json::from_str(&text)?;
-                        control_tx.send(touch_event).await;
-                    }
-                    Some(Ok(Message::Close(_))) => break,
-                }
-            }
-        }
-    }
-}
-```
-
-### 8.4 追帧策略
-
-```
-当客户端处理速度慢于视频帧率时,广播通道会积压帧:
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         追帧 (Frame Catching Up)                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  广播通道:  [帧1] [帧2] [帧3] [帧4] [帧5] [帧6] ... [帧N]                 │
-│              ↑                                        ↑                 │
-│              │                                        │                 │
-│           客户端位置                               最新帧                │
-│           (滞后)                                                        │
-│                                                                         │
-│  当检测到 RecvError::Lagged 时:                                          │
-│                                                                         │
-│  1. 进入追帧模式                                                         │
-│  2. 使用 try_recv() 快速消费所有积压帧                                    │
-│  3. 只发送最新的几帧给客户端                                              │
-│  4. 跳过中间的旧帧以减少延迟                                              │
-│                                                                         │
-│  效果: 牺牲流畅性换取低延迟                                               │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 9. 前端解码与渲染
-
-### 9.0 多解码器架构
-
-系统支持三种解码器，按优先级自动降级：
-
-| 解码器     | 优先级 | 特点                     | 兼容性                    |
-| ---------- | ------ | ------------------------ | ------------------------- |
-| WebCodecs  | 1      | 硬件加速，CPU 占用极低   | Chrome 94+, Edge 94+      |
-| JMuxer     | 2      | MSE，浏览器原生解码      | 支持 MSE 的现代浏览器     |
-| Broadway   | 3      | 纯 JS 软解码，兼容性最好 | 几乎所有浏览器            |
-
-用户可通过 URL 参数指定解码器：`?decoder=webcodecs` / `?decoder=jmuxer` / `?decoder=broadway`
-
-```javascript
-// 解码器管理器 - 自动检测和降级
-const DecoderManager = {
-    getBestDecoder() {
-        if (WebCodecsDecoder.isSupported()) return 'webcodecs';
-        if (JMuxerDecoder.isSupported()) return 'jmuxer';
-        if (BroadwayDecoder.isSupported()) return 'broadway';
-        return null;
-    }
-};
-```
-
-### 9.1 WebCodecs 解码流程
-
-```javascript
-// 初始化解码器
-decoder = new VideoDecoder({
-    output: (frame) => {
-        // 绘制到 canvas
-        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-        frame.close();
+// runtime.rs（简化）
+Self::push_event(
+    &session_id,
+    &events,
+    SessionEvent::ResolutionChanged {
+        width,
+        height,
+        new_handle,
+        generation,
     },
-    error: (e) => console.error('Decoder error:', e)
-});
+);
 
-// 配置解码器
-decoder.configure({
-    codec: 'avc1.42001E',          // H.264 Baseline Profile Level 3.0
-    optimizeForLatency: true,       // 优化延迟
-    hardwareAcceleration: 'prefer-hardware',  // 优先硬件加速
-});
+flutter_callback_register::notify_session_event(session_id, &payload);
 ```
 
-### 9.2 NAL 单元处理逻辑
+## 9. 解码与渲染链路（当前实现）
 
-```javascript
-ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) {
-        const data = new Uint8Array(event.data);
+### 9.1 解码模式
 
-        // 解析 NAL 类型 (跳过 00 00 00 01 起始码)
-        const nalType = data[4] & 0x1F;
+`SessionConfigV2.decoder_mode` 支持：
 
-        switch (nalType) {
-            case 7:  // SPS
-                cachedSPS = data;
-                return;  // 不立即解码,等待 IDR
+- `PreferHardware`：优先硬解，失败回退软解
+- `ForceHardware`：强制硬解
+- `ForceSoftware`：强制软解
 
-            case 8:  // PPS
-                cachedPPS = data;
-                return;  // 不立即解码,等待 IDR
+### 9.2 解码流程
 
-            case 5:  // IDR (关键帧)
-                // 合并 SPS + PPS + IDR
-                const combined = new Uint8Array(
-                    cachedSPS.length + cachedPPS.length + data.length
-                );
-                combined.set(cachedSPS, 0);
-                combined.set(cachedPPS, cachedSPS.length);
-                combined.set(data, cachedSPS.length + cachedPPS.length);
+1. `FramedVideoStreamReader::read_packet()` 读取 scrcpy 分帧包
+2. `DecoderPipeline::push_framed_packet(...)` 投递解码队列
+3. `FfmpegDecoder` 产出 `DecodedFrame::{GpuShared,CpuBgra}`
+4. runtime 通过回调桥将帧与会话事件上报上层
 
-                // 作为关键帧解码
-                decoder.decode(new EncodedVideoChunk({
-                    type: 'key',
-                    timestamp: performance.now() * 1000,
-                    data: combined
-                }));
-                break;
+### 9.3 渲染输出模式
 
-            default:  // P/B 帧
-                // 限制解码器队列,防止积压
-                if (decoder.decodeQueueSize > 3) {
-                    console.warn('Dropping P-frame');
-                    return;
-                }
+- `RenderPipelineMode::Original`：共享句柄路径（GPU）
+- `RenderPipelineMode::CpuPixelBufferV2`：RGBA 像素缓冲路径（CPU）
 
-                decoder.decode(new EncodedVideoChunk({
-                    type: 'delta',
-                    timestamp: performance.now() * 1000,
-                    data: data
-                }));
-        }
-    }
-};
-```
+### 9.4 低延迟策略
 
-### 9.3 触控事件处理
-
-```javascript
-// 坐标转换: Canvas像素 → 归一化坐标 [0, 1]
-function normalizeCoords(canvasX, canvasY) {
-    const rect = canvas.getBoundingClientRect();
-    const x = (canvasX - rect.left) / rect.width;
-    const y = (canvasY - rect.top) / rect.height;
-    return {
-        x: Math.max(0, Math.min(1, x)),
-        y: Math.max(0, Math.min(1, y))
-    };
-}
-
-// 发送触控事件
-function sendTouchEvent(action, pointerId, x, y, pressure = 1.0) {
-    const event = {
-        action: action,           // 0=Down, 1=Up, 2=Move
-        pointer_id: pointerId,    // -1=鼠标, >=0=触摸
-        x: x,                     // 归一化坐标
-        y: y,
-        pressure: pressure,
-        width: videoWidth,        // 视频流分辨率
-        height: videoHeight,
-        buttons: action === 1 ? 0 : 1  // UP时buttons=0
-    };
-
-    ws.send(JSON.stringify(event));
-}
-
-// 鼠标事件 (PC)
-canvas.addEventListener('mousedown', (e) => {
-    const coords = normalizeCoords(e.clientX, e.clientY);
-    sendTouchEvent(0, -1, coords.x, coords.y);  // ACTION_DOWN, MOUSE_ID=-1
-});
-
-// 触摸事件 (移动端)
-canvas.addEventListener('touchstart', (e) => {
-    for (let touch of e.changedTouches) {
-        const coords = normalizeCoords(touch.clientX, touch.clientY);
-        sendTouchEvent(0, touch.identifier, coords.x, coords.y, touch.force || 1.0);
-    }
-});
-```
+- 解码/帧队列使用小容量，优先最新帧
+- 同代际帧覆盖，减少历史帧积压
+- 旋转重配时以 `generation` 隔离旧帧
 
 ---
-
 ## 10. 数据流转图
 
-### 10.1 视频流数据流转
+### 10.1 视频流数据流转（当前实现）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           视频流数据流转                                  │
+│                        视频流数据流转（FFI 主链路）                      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  Android 设备                                                            │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Surface → MediaCodec (H.264 编码) → NAL Units                   │   │
-│  └──────────────────────────────────┬──────────────────────────────┘   │
-│                                     │                                  │
-│                                     │ Annex-B NAL Stream               │
-│                                     │ (00 00 00 01 + NAL Data)         │
-│                                     ▼                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  scrcpy-server → localabstract:scrcpy                           │   │
-│  └──────────────────────────────────┬──────────────────────────────┘   │
-│                                     │                                  │
-│ ════════════════════════════════════╪═══════════════════════════════   │
-│  ADB Forward (USB/WiFi)             │                                  │
-│ ════════════════════════════════════╪═══════════════════════════════   │
-│                                     │                                  │
-│  PC 端                              ▼                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  TCP:27183 → VideoStreamReader                                  │   │
-│  │                                                                 │   │
-│  │  ┌──────────────────────────────────────────────────────────┐   │   │
-│  │  │  逐字节读取 → 检测起始码 → 提取NAL单元 → VideoFrame           │   │   │
-│  │  └────────────────────────────┬─────────────────────────────┘   │   │
-│  └───────────────────────────────┼─────────────────────────────────┘   │
-│                                  │                                     │
-│                                  │ VideoFrame { pts, frame_type, data }│
-│                                  ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Main Event Loop                                                │   │
-│  │                                                                 │   │
-│  │  if SPS/PPS → 缓存到 video_config                                │   │
-│  │  添加起始码 [00 00 00 01] + NAL Data                              │   │
-│  │  → broadcast::Sender<Bytes>                                     │   │
-│  └───────────────────────────────┬─────────────────────────────────┘   │
-│                                  │                                     │
-│                                  │ Bytes (带起始码的NAL)                │
-│                                  ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  WebSocketServer                                                │   │
-│  │                                                                 │   │
-│  │  broadcast::Receiver → Message::Binary                          │   │
-│  │  → WebSocket 发送到所有客户端                                      │   │
-│  └───────────────────────────────┬─────────────────────────────────┘   │
-│                                  │                                     │
-│ ═════════════════════════════════╪══════════════════════════════════   │
-│  WebSocket (ws://)               │                                     │
-│ ═════════════════════════════════╪══════════════════════════════════   │
-│                                  │                                     │
-│  浏览器                           ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  JavaScript WebCodecs                                           │   │
-│  │                                                                 │   │
-│  │  ArrayBuffer → 解析NAL类型 → 缓存SPS/PPS                          │   │
-│  │  → IDR时合并(SPS+PPS+IDR) → EncodedVideoChunk                    │   │
-│  │  → VideoDecoder.decode()                                        │   │
-│  │  → VideoFrame → Canvas.drawImage()                              │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
+│  │  Surface -> MediaCodec(H.264) -> scrcpy-server v3.3.4          │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     │ video socket + framed packet      │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ adb forward: tcp:video_port -> localabstract:scrcpy            │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│  PC / Rust Runtime                  ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ SessionManager::connect_v2()                                   │    │
+│  │ - ScrcpyServer::connect_video()                                │    │
+│  │ - read_video_header(dummy + codec_meta)                        │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ FramedVideoStreamReader                                        │    │
+│  │ - read_packet() 读取完整编码包                                 │    │
+│  │ - is_config / is_keyframe 标记同步到解码管线                    │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ DecoderPipeline + FfmpegDecoder                                │    │
+│  │ - PreferHardware / ForceHardware / ForceSoftware               │    │
+│  │ - 输出 GpuShared 或 CpuBgra 帧                                  │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ runtime 回调桥接                                                 │    │
+│  │ - notify_v1_frame(handle, w, h, gen, pts)                      │    │
+│  │ - notify_v2_frame_raw(frame_id, rgba, w, h, ...)               │    │
+│  │ - SessionEvent::ResolutionChanged / Running / Reconnecting      │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ Upper App (FFI caller)                                         │    │
+│  │ - 消费帧通知与会话事件，完成渲染与状态管理                         │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.2 控制流数据流转
+### 10.2 控制流数据流转（触控/按键）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           控制流数据流转                                  │
+│                         控制流数据流转（当前实现）                       │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  浏览器                                                                  │
+│  Upper App                                                              │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  用户操作 (点击/滑动)                                              │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  normalizeCoords() → 归一化坐标 [0,1]                             │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  JSON.stringify({action, pointer_id, x, y, pressure, ...})      │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  WebSocket.send(text)                                           │   │
-│  └───────────────────────────────┬─────────────────────────────────┘   │
-│                                  │                                     │
-│ ═════════════════════════════════╪══════════════════════════════════   │
-│  WebSocket (ws://)               │  JSON Text                          │
-│ ═════════════════════════════════╪══════════════════════════════════   │
-│                                  │                                     │
-│  PC 端                           ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  WebSocketServer::handle_client()                               │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  Message::Text(json) → serde_json::from_str::<TouchEvent>()     │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  control_tx.send(touch_event)                                   │   │
-│  └───────────────────────────────┬─────────────────────────────────┘   │
-│                                  │                                      │
-│                                  │ mpsc::Sender<TouchEvent>             │
-│                                  ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Main Event Loop                                                │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  control_rx.recv() → TouchEvent                                 │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  control_channel.send_touch_event(&event)                       │   │
-│  └───────────────────────────────┬─────────────────────────────────┘   │
-│                                  │                                     │
-│                                  │ TouchEvent                          │
-│                                  ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  ControlChannel::send_touch_event()                             │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  构建 32 字节二进制消息 (Big Endian)                               │   │
-│  │  [type][action][pointer_id][x][y][w][h][pressure][ab][buttons]  │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  TCP write_all() + flush()                                      │   │
-│  └───────────────────────────────┬─────────────────────────────────┘   │
-│                                  │                                     │
-│ ═════════════════════════════════╪══════════════════════════════════   │
-│  ADB Forward TCP:27184           │  Binary (32 bytes)                  │
-│ ═════════════════════════════════╪══════════════════════════════════   │
-│                                  │                                     │
-│  Android 设备                    ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  scrcpy-server                                                  │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  解析控制消息 → InputManager.injectInputEvent()                   │   │
-│  │  │                                                              │   │
-│  │  ▼                                                              │   │
-│  │  Android 系统触摸事件 → 应用响应                                   │    │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
+│  │ send_touch / send_key / send_scroll / send_text / clipboard     │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ rust_scrcpy_api::service                                        │    │
+│  │ - 根据 session_id 定位 runtime                                   │    │
+│  │ - 转发到 SessionRuntime::send_*                                  │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ RealSessionRuntime 命令队列                                      │    │
+│  │ - RuntimeCommand::{Touch,Key,Scroll,Text,Clipboard,...}         │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ ControlChannel                                                  │    │
+│  │ - 按 scrcpy 控制协议编码（二进制 Big Endian）                      │    │
+│  │ - write_all/flush 到 control socket                             │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ adb forward: tcp:control_port -> localabstract:scrcpy           │    │
+│  └──────────────────────────────────┬──────────────────────────────┘    │
+│                                     │                                   │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ scrcpy-server                                                   │    │
+│  │ - 解析控制包                                                     │    │
+│  │ - 注入到 Android InputManager                                    │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1569,61 +1147,71 @@ let vscroll: i32 = 1;   // 向上滚动
 let vscroll_i16 = (vscroll * 2048) as i16;  // 2048 = 0x0800
 ```
 
-### 11.3 坐标系转换
+### 11.3 坐标系转换（当前触控链路）
 
-```
-浏览器坐标 → 归一化坐标 → 像素坐标
+当前实现中，坐标由上层应用计算后通过 `send_touch` 传入 Rust：
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│  浏览器 Canvas                    归一化                 Android 设备       │
-│  ┌──────────────┐                ┌─────────┐            ┌────────────┐   │
-│  │              │                │         │            │            │   │
-│  │   (300,200)  │  ────────►     │(0.3,0.2)│ ────────►  │ (324,384)  │   │
-│  │    ●         │  /rect.w,h     │   ●     │  *dev_w,h  │    ●       │   │
-│  │              │                │         │            │            │   │
-│  │  1000x1000   │                │ [0,1]   │            │ 1080x1920  │   │
-│  └──────────────┘                └─────────┘            └────────────┘   │
-│                                                                          │
-│  计算过程:                                                                │
-│  x_norm = (clientX - rect.left) / rect.width = 300/1000 = 0.3            │
-│  y_norm = (clientY - rect.top) / rect.height = 200/1000 = 0.2            │
-│  x_pixel = x_norm * video_width = 0.3 * 1080 = 324                       │
-│  y_pixel = y_norm * video_height = 0.2 * 1920 = 384                      │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
+- 上层输入坐标：窗口/控件坐标（例如 `clientX/clientY`）
+- 归一化坐标：`x_norm/y_norm`，范围 `[0,1]`
+- 注入基准尺寸：当前视频帧尺寸（`width/height`，来自当前会话分辨率）
+
+```text
+上层坐标 -> 归一化坐标 -> TouchEvent(width/height + x/y) -> scrcpy 注入 
+
+x_norm = (x - view_left) / view_width
+y_norm = (y - view_top)  / view_height
+
+x_norm, y_norm 约束到 [0, 1]
+TouchEvent.width/height 使用当前视频帧尺寸（避免旋转/降采样后坐标失配）
 ```
 
-### 11.4 IDR 帧请求机制
+示例：
+
+- 视图区域：`1000x1000`
+- 触点：`(300, 200)`
+- 当前视频帧：`1080x1920`
+
+则：
+
+- `x_norm = 300 / 1000 = 0.3`
+- `y_norm = 200 / 1000 = 0.2`
+- 发送 `TouchEvent { x: 0.3, y: 0.2, width: 1080, height: 1920, ... }`
+
+这样可保证设备旋转、分辨率变化、缩放场景下触控仍映射到正确位置。
+
+### 11.4 IDR 帧请求机制（当前实现）
+
+当前实现包含两条 IDR 触发路径：
+
+1. **手动请求**：上层调用 `request_idr(session_id)`，runtime 下发 `RuntimeCommand::RequestIdr`，通过控制通道触发 `send_reset_video()`。
+2. **自动恢复**：解码管线出现失败信号时，runtime 自动请求 IDR；硬解模式会进入短暂恢复窗口，超时则升级为会话重连。
 
 ```
-新客户端连接时的 IDR 帧获取流程:
+IDR 触发与恢复流程
 
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Browser     │     │  WS Server   │     │  Main Loop   │
-└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
-       │                    │                    │
-       │  WS Connect        │                    │
-       │───────────────────>│                    │
-       │                    │  idr_request_tx    │
-       │                    │───────────────────>│
-       │                    │                    │
-       │  config JSON       │                    │
-       │<───────────────────│                    │
-       │                    │                    │
-       │  cached SPS/PPS    │                    │
-       │<───────────────────│                    │
-       │                    │                    │
-       │                    │                    │ 设置 pending_idr = true
-       │                    │                    │
-       │                    │                    │ 等待下一个 IDR 帧
-       │                    │                    │ (通常在 1 秒内到达)
-       │                    │                    │
-       │                    │  broadcast IDR     │
-       │<───────────────────│<───────────────────│
-       │                    │                    │
-       │  可以开始解码!     │                     │
-       │                    │                    │
+Upper App               rust_scrcpy_api/runtime              scrcpy-server
+   │                             │                                │
+   │ request_idr()               │                                │
+   │────────────────────────────>│ RuntimeCommand::RequestIdr     │
+   │                             │───────────────────────────────>│
+   │                             │    send_reset_video()          │
+   │                             │                                │
+   │                             │ <视频关键帧返回>                 │
+   │                             │                                │
+
+自动路径（解码失败）
+
+DecoderPipeline fail signal -> runtime 检测 need_idr_signals
+                         -> send_reset_video()
+                         -> 若硬解: 进入恢复窗口等待 resync
+                         -> 成功: 继续当前会话
+                         -> 超时: SessionEvent::Reconnecting
 ```
+
+设计目标：
+
+- 降低花屏/绿屏后的恢复时间。
+- 尽量先做“同会话内重同步”，减少整会话重连次数。
 
 ### 11.5 SPS/PPS 缓存策略
 
@@ -1662,24 +1250,28 @@ if frame.frame_type == FrameType::Config {
 
 ## 12. 配置参数说明
 
-### 12.1 命令行参数
+### 12.1 会话配置参数（当前 API）
 
-| 参数                     | 短选项 | 默认值                                  | 说明                         |
-| ------------------------ | ------ | --------------------------------------- | ---------------------------- |
-| `--adb-path`             | `-a`   | `../adb/adb.exe`                        | ADB 可执行文件路径           |
-| `--server-path`          | `-s`   | `../scrcpy-server/scrcpy-server-v3.3.4` | scrcpy-server JAR 路径       |
-| `--list`                 |        | (不启用)                                | 列出所有已连接设备并退出     |
-| `--device`               | `-d`   | (自动选择)                              | 目标设备索引或序列号         |
-| `--max-size`             | `-m`   | `1920`                                  | 最大视频分辨率               |
-| `--bit-rate`             | `-b`   | `4000000`                               | 视频码率 (bps)               |
-| `--max-fps`              | `-f`   | `60`                                    | 最大帧率                     |
-| `--ws-port`              | `-p`   | `8080`                                  | WebSocket 端口               |
-| `--video-port`           |        | `27183`                                 | 视频流端口                   |
-| `--control-port`         |        | `27184`                                 | 控制流端口                   |
-| `--intra-refresh-period` | `-i`   | `1`                                     | IDR 帧间隔 (秒)              |
-| `--video-encoder`        | `-e`   | (自动选择)                              | 指定视频编码器名称           |
-| `--log-level`            | `-l`   | `info`                                  | 日志级别                     |
-| `--public`               |        | (不启用)                                | 启用局域网访问 (0.0.0.0)     |
+| 字段 | 说明 |
+| --- | --- |
+| `adb_path` | ADB 可执行文件路径 |
+| `server_path` | scrcpy-server-v3.3.4 路径 |
+| `device_id` | 目标设备序列号 |
+| `max_size` | 最大分辨率（长边），0=不限制 |
+| `bit_rate` | 视频码率（bps） |
+| `max_fps` | 最大帧率，0=不限制 |
+| `video_port` | 视频端口（自动探测可用端口） |
+| `control_port` | 控制端口（自动探测可用端口） |
+| `video_encoder` | 指定编码器（可选） |
+| `intra_refresh_period` | IDR 间隔（秒） |
+| `turn_screen_off` | 启动后是否关屏 |
+| `stay_awake` | 会话期间是否常亮 |
+| `scrcpy_verbosity` | scrcpy 日志级别 |
+
+V2 额外参数：
+
+- `decoder_mode`
+- `render_pipeline_mode`
 
 ### 12.2 性能调优建议
 
@@ -1705,49 +1297,25 @@ if frame.frame_type == FrameType::Config {
 
 ### 12.3 模拟器兼容性说明
 
-部分 Android 模拟器（如雷电模拟器）使用 x86 架构，其视频编码器采用 Baseline Profile，压缩效率比真机/ARM 模拟器的 High Profile 低约 30-40%。
+部分 x86 模拟器在 H.264 编码能力上弱于真机，常见表现为高延迟和掉帧。
 
-**问题表现：**
-- 画面卡顿、延迟高
-- CPU 占用较高
+**建议参数：**
 
-**解决方案：**
+1. `max_size=1080`, `bit_rate=2_000_000`
+2. 仍不稳定时降到 `max_size=720`, `bit_rate=1_000_000`
+3. 必要时指定 `video_encoder`
+4. 降低 `max_fps` 以换取稳定性
 
-1. **降低分辨率和码率（推荐）**
-   ```bash
-   rust-scrcpy.exe -m 1080 -b 2000000
-   ```
+**说明：**
 
-2. **进一步降低参数**
-   ```bash
-   rust-scrcpy.exe -m 720 -b 1000000
-   ```
+- 当前链路使用 FFmpeg 解码，不依赖浏览器解码器。
+- 参数优先目标是“稳定 + 低延迟”，而非极限画质。
 
-3. **指定编码器**（查看可用编码器：`adb shell "dumpsys media.codec | grep -i avc"`）
-   ```bash
-   rust-scrcpy.exe -m 1080 -b 2000000 -e c2.android.avc.encoder
-   ```
-
-4. **降低帧率换取更高分辨率**
-   ```bash
-   rust-scrcpy.exe -m 1080 -b 2000000 -f 30
-   ```
-
-**技术细节：**
-- 程序会根据 SPS 中的 profile_idc 自动配置 WebCodecs 解码器
-- Baseline Profile (66): `avc1.42xxxx`
-- High Profile (100): `avc1.64xxxx`
-
-### 12.4 雷电模拟器适配技术细节
-
-为支持雷电模拟器等 x86 架构模拟器，进行了以下技术改进：
+### 12.4 x86 模拟器适配技术细节（当前实现）
 
 #### 12.4.1 SPS 防竞争字节处理
 
-H.264 SPS 数据中可能包含防竞争字节 (Emulation Prevention Bytes)，即 `0x00 0x00 0x03` 序列。雷电模拟器的 SPS 包含此类字节，导致解析偏移错误。
-
 ```rust
-// src/main.rs - 移除防竞争字节
 fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -1755,7 +1323,7 @@ fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
         if i + 2 < data.len() && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03 {
             result.push(0x00);
             result.push(0x00);
-            i += 3; // 跳过 0x03
+            i += 3;
         } else {
             result.push(data[i]);
             i += 1;
@@ -1765,89 +1333,27 @@ fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
 }
 ```
 
-#### 12.4.2 动态 Codec 检测
+#### 12.4.2 IDR 恢复机制
 
-前端 WebCodecs 解码器根据 SPS 中的 profile_idc 动态配置 codec string：
+- 手动：`request_idr(session_id)`
+- 自动：解码失败信号触发 `send_reset_video()`
+- 硬解模式：先尝试短窗口重同步，超时再重连
 
-```javascript
-// 从 SPS 解析 codec string
-reconfigureFromSPS(spsData) {
-    // SPS 格式: 00 00 00 01 [NAL header] [profile_idc] [constraint_flags] [level_idc]
-    const profileIdc = spsData[5];
-    const constraintFlags = spsData[6];
-    const levelIdc = spsData[7];
+#### 12.4.3 视频流批量读取优化
 
-    // 构建 codec string: avc1.XXYYZZ
-    const codecString = `avc1.${profileIdc.toString(16).padStart(2, '0')}${constraintFlags.toString(16).padStart(2, '0')}${levelIdc.toString(16).padStart(2, '0')}`;
+视频读取采用批量缓冲，减少逐字节读取开销。
 
-    this.decoder.configure({
-        codec: codecString,
-        optimizeForLatency: true,
-        hardwareAcceleration: 'prefer-hardware',
-    });
-}
-```
-
-#### 12.4.3 IDR 帧缓存机制
-
-新客户端连接时，由于 broadcast channel 缓冲有限，可能错过 IDR 帧导致画面无法显示。解决方案是缓存最后一个 IDR 帧：
-
-```rust
-// src/main.rs - 缓存 IDR 帧
-if nal_type == 5 {
-    let video_config_clone = video_config.clone();
-    let idr_clone = nal_bytes.clone();
-    tokio::spawn(async move {
-        let mut config = video_config_clone.write().await;
-        config.last_idr = Some(idr_clone);
-    });
-}
-
-// src/ws/server.rs - 新客户端连接时发送缓存的 SPS + PPS + IDR
-if let Some(idr) = &config.last_idr {
-    socket.send(Message::Binary(idr.to_vec())).await;
-}
-```
-
-#### 12.4.4 视频流批量读取优化
-
-原实现逐字节读取视频流效率低下，改为批量读取：
-
-```rust
-// src/scrcpy/video.rs - 批量读取
-pub async fn read_frame(&mut self, _with_meta: bool) -> Result<Option<VideoFrame>> {
-    let mut read_buf = [0u8; 8192];  // 8KB 批量读取
-
-    loop {
-        if let Some(nal) = self.try_extract_nal() {
-            return Ok(Some(nal));
-        }
-
-        match self.stream.read(&mut read_buf).await {
-            Ok(0) => return Ok(None),
-            Ok(n) => self.buffer.extend_from_slice(&read_buf[..n]),
-            Err(e) => return Err(...),
-        }
-    }
-}
-```
-
-#### 12.4.5 修改汇总
+#### 12.4.4 修改汇总（当前代码）
 
 | 文件 | 修改内容 |
 |------|----------|
-| `src/main.rs` | 添加 `remove_emulation_prevention_bytes()` 函数处理 SPS |
-| `src/main.rs` | 添加 `--video-encoder` 命令行参数 |
-| `src/main.rs` | 缓存 IDR 帧用于新客户端快速显示 |
-| `src/scrcpy/server.rs` | 添加 `video_encoder` 参数支持 |
-| `src/scrcpy/video.rs` | 视频流读取从逐字节改为 8KB 批量读取 |
-| `src/ws/server.rs` | `VideoConfig` 添加 `last_idr` 字段 |
-| `src/ws/server.rs` | 新客户端连接时发送 SPS + PPS + IDR |
-| `src/ws/server.rs` | broadcast channel 缓冲从 2 增加到 60 |
-| `src/ws/server.rs` | 前端 WebCodecs 解码器动态配置 codec string |
-| `src/ws/server.rs` | 导航按钮大小改为较短边的 0.1 倍 |
+| `src/rust_scrcpy_api/runtime.rs` | 会话运行时、事件回调、重连与 IDR 恢复 |
+| `src/session/manager.rs` | connect_v2 建链与方向控制 |
+| `src/scrcpy/server.rs` | server 参数、端口探测、协议头读取 |
+| `src/decoder/ffmpeg_decoder.rs` | FFmpeg 解码器（硬解/软解策略） |
+| `src/decoder/pipeline.rs` | 解码管线与回压控制 |
+| `src/utils/port.rs` | 端口可用性检测与自动寻找 |
 
----
 
 ## 13. 错误处理
 
@@ -1888,7 +1394,6 @@ pub type Result<T> = std::result::Result<T, ScrcpyError>;
 | `Server file not found`              | server JAR 不存在    | 检查 `--server-path` 参数    |
 | `Failed to connect after 5 attempts` | 端口转发失败         | 重启 ADB 服务                |
 | `Buffer overflow`                    | 视频流积压           | 提高处理速度或降低画质       |
-| `WebSocket send failed`              | 客户端断开           | 正常断开,无需处理            |
 | `No available port found`            | 端口范围内无可用端口 | 释放占用的端口或调整起始端口 |
 
 ---
@@ -1947,7 +1452,6 @@ pub fn find_available_ports(start_port: u16, count: usize, max_attempts: u16) ->
 | -------------- | ------ | --------------- | ------------- |
 | Video Port     | 27183  | 27183-27283     | scrcpy 视频流 |
 | Control Port   | 27184  | video_port+1 起 | scrcpy 控制流 |
-| WebSocket Port | 8080   | 8080-8180       | 浏览器连接    |
 
 ### 14.4 工作流程
 
@@ -1957,7 +1461,7 @@ pub fn find_available_ports(start_port: u16, count: usize, max_attempts: u16) ->
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  1. 用户配置端口                                                          │
-│     --ws-port 8080 --video-port 27183 --control-port 27184              │
+│     --video-port 27183 --control-port 27184              │
 │                                                                         │
 │  2. 检测视频端口                                                          │
 │     ┌─────────────────────────────────────────────────────────┐         │
@@ -1971,13 +1475,6 @@ pub fn find_available_ports(start_port: u16, count: usize, max_attempts: u16) ->
 │  3. 检测控制端口 (从 video_port + 1 开始)                                  │
 │     确保控制端口 > 视频端口，避免冲突                                        │
 │                                                                         │
-│  4. 检测 WebSocket 端口                                                  │
-│     独立检测，与 scrcpy 端口无关                                           │
-│                                                                         │
-│  5. 日志输出实际使用的端口                                                  │
-│     INFO: Video port: 27185 (requested: 27183)                          │
-│     INFO: Control port: 27186 (requested: 27184)                        │
-│     INFO: WebSocket server ready at ws://0.0.0.0:8080/ws                │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -2034,31 +1531,6 @@ impl ScrcpyServer {
 }
 ```
 
-### 14.7 WebSocketServer 端口管理
-
-```rust
-// src/ws/server.rs
-
-pub struct WebSocketServer {
-    port: u16,          // 用户请求的端口
-    actual_port: u16,   // 实际使用的端口
-    // ...
-}
-
-impl WebSocketServer {
-    pub fn new(port: u16, ...) -> Result<Self> {
-        // 自动寻找可用端口
-        let actual_port = find_available_port(port, 100)?;
-
-        Ok(Self { port, actual_port, ... })
-    }
-
-    /// 获取实际使用的端口
-    pub fn get_actual_port(&self) -> u16 {
-        self.actual_port
-    }
-}
-```
 
 ### 14.8 错误处理
 
@@ -2083,45 +1555,60 @@ pub enum ScrcpyError {
 ### A. 项目文件结构
 
 ```
-rust-scrcpy/
-├── Cargo.toml              # 项目配置和依赖
+rust-ws-scrcpy/
+├── Cargo.toml
 ├── src/
-│   ├── main.rs             # 主程序入口、事件循环、SPS解析
-│   ├── error.rs            # 错误类型定义
+│   ├── lib.rs
+│   ├── error.rs
+│   ├── rust_scrcpy_api.rs
+│   ├── rust_scrcpy_api/
+│   │   ├── model.rs
+│   │   ├── service.rs
+│   │   └── runtime.rs
 │   ├── adb/
-│   │   ├── mod.rs          # ADB 模块导出
-│   │   ├── client.rs       # ADB 客户端实现
-│   │   └── device.rs       # 设备信息 (coming soon)
+│   │   ├── mod.rs
+│   │   └── client.rs
 │   ├── scrcpy/
-│   │   ├── mod.rs          # scrcpy 模块导出
-│   │   ├── server.rs       # ScrcpyServer 实现
-│   │   ├── video.rs        # 视频流读取器
-│   │   └── control.rs      # 控制通道实现
-│   ├── utils/
-│   │   ├── mod.rs          # 工具模块导出
-│   │   └── port.rs         # 端口可用性检测和自动寻找
-│   └── ws/
-│       ├── mod.rs          # WebSocket 模块导出
-│       └── server.rs       # WebSocket 服务器和 HTML 页面
-└── sum2.0.md               # 本技术文档
+│   │   ├── mod.rs
+│   │   ├── server.rs
+│   │   ├── framed_video.rs
+│   │   └── control.rs
+│   ├── decoder/
+│   │   ├── mod.rs
+│   │   ├── ffmpeg_decoder.rs
+│   │   └── pipeline.rs
+│   ├── session/
+│   │   ├── manager.rs
+│   │   └── encoding_profile.rs
+│   └── utils/
+│       └── port.rs
+├── scripts/
+└── examples/
 ```
 
 ### B. 依赖库说明
 
-| 依赖      | 版本 | 用途                  |
-| --------- | ---- | --------------------- |
-| tokio     | 1.42 | 异步运行时            |
-| axum      | 0.7  | HTTP/WebSocket 服务器 |
-| serde     | 1.0  | JSON 序列化           |
-| bytes     | 1.9  | 高效字节缓冲          |
-| tracing   | 0.1  | 日志系统              |
-| clap      | 4.5  | 命令行参数解析        |
-| thiserror | 2.0  | 错误处理              |
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| tokio | 1.42 | 异步运行时 |
+| serde / serde_json | 1.0 | 数据序列化 |
+| bytes | 1.9 | 高效字节缓冲 |
+| tracing | 0.1 | 日志系统 |
+| thiserror | 2.0 | 错误处理 |
+| ffmpeg-next | 8 | H.264 解码 |
+| flutter_rust_bridge | 2.11.1 | FFI 桥接 |
+| windows | 0.58 | Windows API |
 
 ### C. 参考资料
 
 - [scrcpy 官方仓库](https://github.com/Genymobile/scrcpy)
-- [WebCodecs API](https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API)
 - [Android InputManager](https://developer.android.com/reference/android/hardware/input/InputManager)
 
-**💐感谢[Claude Opus 4.5](https://claude.ai)和[ChatGPT 5.2](https://chatgpt.com)帮我阅读scrcpy源码和分析scrcpy流量包💐**
+### D. 鸣谢
+
+- [Creeeeeeeeeeper/rust-ws-scrcpy](https://github.com/Creeeeeeeeeeper/rust-ws-scrcpy)
+- [Claude Opus 4.5](https://claude.ai)
+- [ChatGPT 5.2](https://chatgpt.com)
+
+
+
