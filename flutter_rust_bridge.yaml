@@ -1,0 +1,8 @@
+rust_root: .
+rust_input: crate::rust_scrcpy_api
+dart_output: ../sw_game_helper/lib/platforms/windows/bridge_generated
+dart_entrypoint_class_name: RustLib
+build_runner: false
+web: false
+auto_upgrade_dependency: false
+dart_fix: false
