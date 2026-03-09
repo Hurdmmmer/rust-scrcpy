@@ -4,6 +4,9 @@ version = "2.2.0"
 edition = "2021"
 authors = ["zzzzyg"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
 [lib]
 # Flutter 通过 FFI 加载动态库，必须输出 cdylib。
 # 同时保留 rlib，便于本工程内部测试与复用。
@@ -31,9 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 错误处理
 anyhow = "1.0"
 thiserror = "2.0"
-
-# 进程管理（用于ADB命令）
-tokio-process = "0.2"
 
 # FFmpeg 解码（用于 test_full_pipeline 回归示例）
 ffmpeg-next = "8"
