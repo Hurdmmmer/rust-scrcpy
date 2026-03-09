@@ -312,43 +312,64 @@ async fn adb_set_orientation_mode(
     device_id: &str,
     mode: OrientationMode,
 ) -> Result<()> {
+    // Android 11+/12+/13 上，`cmd window user-rotation` 通常比直接写 settings 更可靠。
+    // 这里采用“新命令优先，旧命令兜底”的策略，避免部分 ROM 上方向设置无效。
+    async fn adb_shell_try(adb_path: &str, device_id: &str, command: &str) -> Result<()> {
+        let _ = adb_execute(adb_path, &["-s", device_id, "shell", command]).await?;
+        Ok(())
+    }
+
     match mode {
         OrientationMode::Auto => {
-            let _ = adb_execute(
-                adb_path,
-                &["-s", device_id, "shell", "settings put system accelerometer_rotation 1"],
-            )
-            .await?;
+            if adb_shell_try(adb_path, device_id, "cmd window user-rotation free")
+                .await
+                .is_err()
+            {
+                let _ = adb_execute(
+                    adb_path,
+                    &["-s", device_id, "shell", "settings put system accelerometer_rotation 1"],
+                )
+                .await?;
+            }
         }
         OrientationMode::Portrait => {
-            let _ = adb_execute(
-                adb_path,
-                &["-s", device_id, "shell", "settings put system accelerometer_rotation 0"],
-            )
-            .await?;
-            let _ = adb_execute(
-                adb_path,
-                &["-s", device_id, "shell", "settings put system user_rotation 0"],
-            )
-            .await?;
+            if adb_shell_try(adb_path, device_id, "cmd window user-rotation lock 0")
+                .await
+                .is_err()
+            {
+                let _ = adb_execute(
+                    adb_path,
+                    &["-s", device_id, "shell", "settings put system accelerometer_rotation 0"],
+                )
+                .await?;
+                let _ = adb_execute(
+                    adb_path,
+                    &["-s", device_id, "shell", "settings put system user_rotation 0"],
+                )
+                .await?;
+            }
         }
         OrientationMode::Landscape => {
-            let _ = adb_execute(
-                adb_path,
-                &["-s", device_id, "shell", "settings put system accelerometer_rotation 0"],
-            )
-            .await?;
-            let _ = adb_execute(
-                adb_path,
-                &["-s", device_id, "shell", "settings put system user_rotation 1"],
-            )
-            .await?;
+            if adb_shell_try(adb_path, device_id, "cmd window user-rotation lock 1")
+                .await
+                .is_err()
+            {
+                let _ = adb_execute(
+                    adb_path,
+                    &["-s", device_id, "shell", "settings put system accelerometer_rotation 0"],
+                )
+                .await?;
+                let _ = adb_execute(
+                    adb_path,
+                    &["-s", device_id, "shell", "settings put system user_rotation 1"],
+                )
+                .await?;
+            }
         }
     }
 
     Ok(())
 }
-
 /// 处理一条运行时命令。
 ///
 /// 返回值语义：
@@ -979,6 +1000,7 @@ pub async fn get_session_stats(session_id: String) -> Result<SessionStats> {
         Ok(default_stats())
     }
 }
+
 
 
 
