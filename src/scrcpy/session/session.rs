@@ -34,6 +34,8 @@ pub struct Session {
     control: Option<ControlChannel>,
     video_stream: Option<FramedVideoStreamReader>,
     events: VecDeque<SessionEvent>,
+    /// 设备侧剪贴板更新队列（由控制通道 reader 推送）。
+    clipboard_updates: VecDeque<String>,
     disposed: bool,
 
     input_mode: ScrcpyInputMode,
@@ -56,6 +58,7 @@ impl Session {
             control: Some(control),
             video_stream: Some(video_stream),
             events: VecDeque::with_capacity(SESSION_EVENT_QUEUE_LIMIT),
+            clipboard_updates: VecDeque::with_capacity(64),
             disposed: false,
             input_mode,
             uhid_started: false,
@@ -77,6 +80,30 @@ impl Session {
             out.push(event);
         }
         out
+    }
+
+    /// 拉取设备侧剪贴板更新。
+    pub fn drain_clipboard_updates(&mut self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.clipboard_updates.len());
+        while let Some(text) = self.clipboard_updates.pop_front() {
+            out.push(text);
+        }
+        out
+    }
+
+    /// 同步消费控制通道中的设备消息（ACK/剪贴板）。
+    pub fn poll_control_messages(&mut self) -> Result<()> {
+        if self.disposed {
+            return Ok(());
+        }
+        let updates = self.control_channel_mut()?.take_clipboard_updates();
+        for text in updates {
+            self.clipboard_updates.push_back(text);
+            while self.clipboard_updates.len() > 64 {
+                let _ = self.clipboard_updates.pop_front();
+            }
+        }
+        Ok(())
     }
 
     pub async fn dispose(&mut self) -> Result<()> {
@@ -196,17 +223,30 @@ impl Session {
         let ret = match self.input_mode {
             ScrcpyInputMode::Inject => self.control_channel_mut()?.send_key_event(event).await,
             ScrcpyInputMode::Uhid => {
-                self.ensure_uhid_ready().await?;
-                self.uhid_keyboard_state
-                    .update_key(event.action, event.keycode);
-                self.send_uhid_report().await
-            }
-            ScrcpyInputMode::Auto => {
-                let uhid_try = async {
+                if UhidKeyboardState::supports_android_keycode(event.keycode) {
                     self.ensure_uhid_ready().await?;
                     self.uhid_keyboard_state
                         .update_key(event.action, event.keycode);
                     self.send_uhid_report().await
+                } else {
+                    // UHID 不支持的语义键（如 COPY/CUT/PASTE）走 Inject，保持和 scrcpy 语义一致。
+                    info!(
+                        "[会话] UHID 不支持 keycode={}，回退 Inject 通道",
+                        event.keycode
+                    );
+                    self.control_channel_mut()?.send_key_event(event).await
+                }
+            }
+            ScrcpyInputMode::Auto => {
+                let uhid_try = async {
+                    if UhidKeyboardState::supports_android_keycode(event.keycode) {
+                        self.ensure_uhid_ready().await?;
+                        self.uhid_keyboard_state
+                            .update_key(event.action, event.keycode);
+                        self.send_uhid_report().await
+                    } else {
+                        self.control_channel_mut()?.send_key_event(event).await
+                    }
                 }
                 .await;
 

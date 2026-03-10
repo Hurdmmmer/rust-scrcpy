@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+use serde_json::json;
 
 use crate::flutter_callback_register;
 use crate::gh_common::{Result, ScrcpyError};
@@ -313,9 +314,24 @@ impl ScrcpyCoreRuntime {
     /// - 先拉取 Session 本地事件；
     /// - 再拉取 Decode 事件并做模型映射。
     fn collect_session_events(&mut self, session_id: &str) {
-        if let Some(session) = self.session_manager.get_mut(session_id) {
-            for event in session.drain_events() {
-                self.push_runtime_event(session_id, event);
+        let (session_events, clipboard_updates) = if let Some(session) = self.session_manager.get_mut(session_id) {
+            let _ = session.poll_control_messages();
+            (session.drain_events(), session.drain_clipboard_updates())
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        for event in session_events {
+            self.push_runtime_event(session_id, event);
+        }
+        for text in clipboard_updates {
+            let payload = json!({
+                "ClipboardChanged": {
+                    "text": text,
+                }
+            });
+            if let Ok(bytes) = serde_json::to_vec(&payload) {
+                flutter_callback_register::notify_session_event(session_id, &bytes);
             }
         }
 
@@ -435,6 +451,8 @@ impl ScrcpyCoreRuntime {
                 .session_manager
                 .get_mut(session_id)
                 .ok_or_else(|| ScrcpyError::Other(format!("invalid session id: {}", session_id)))?;
+            // 每轮泵送前先消费控制通道设备消息，确保剪贴板/ACK 不积压。
+            session.poll_control_messages()?;
             let pipeline = self
                 .decode_pipelines
                 .get_mut(session_id)
@@ -675,4 +693,3 @@ impl ScrcpyCoreRuntime {
         ret
     }
 }
-

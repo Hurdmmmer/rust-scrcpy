@@ -4,10 +4,16 @@
 //! - 把上层触控/键盘/滚轮/文本输入转换成 scrcpy 控制协议二进制消息；
 //! - 通过 TCP 控制通道发送到设备端 server；
 //! - 对发送失败统一返回 `ScrcpyError::Network`，由上层决定重试或重连。
-use tokio::io::AsyncWriteExt;
+use std::collections::{HashSet, VecDeque};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use crate::gh_common::{Result, ScrcpyError};
-use tracing::{info, debug, error};
+use tracing::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 
 // scrcpy控制消息类型（基于scrcpy 3.x协议）
@@ -150,12 +156,29 @@ pub struct ScrollEvent {
 }
 
 pub struct ControlChannel {
-    /// 与 scrcpy server 的控制 socket。
+    /// 与 scrcpy server 的控制写通道。
     ///
     /// 说明：
     /// - 该连接与视频流连接分离；
-    /// - 会话销毁时由 Session 统一释放。
-    stream: TcpStream,
+    /// - 读通道由后台 reader task 独立处理。
+    writer: OwnedWriteHalf,
+    /// 设备消息接收通道（reader task -> ControlChannel）。
+    device_msg_rx: UnboundedReceiver<DeviceMessage>,
+    /// 控制通道 reader task 句柄（会话销毁时 abort）。
+    reader_task: JoinHandle<()>,
+    /// 已收到 ACK 但尚未被 wait 消费的序号集合。
+    acked_sequences: HashSet<u64>,
+    /// 从设备收到但尚未被 Session 消费的剪贴板更新。
+    pending_clipboards: VecDeque<String>,
+    /// 本地递增序号，用于 clipboard ACK 同步。
+    next_sequence: u64,
+}
+
+/// 控制通道设备侧消息。
+#[derive(Debug, Clone)]
+enum DeviceMessage {
+    Clipboard(String),
+    AckClipboard(u64),
 }
 
 impl ControlChannel {
@@ -163,7 +186,152 @@ impl ControlChannel {
     ///
     /// 参数 `stream` 必须是已经和 scrcpy server 建立成功的控制连接。
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        let (read_half, write_half) = stream.into_split();
+        let (tx, rx) = mpsc::unbounded_channel::<DeviceMessage>();
+        let reader_task = tokio::spawn(async move {
+            Self::run_device_message_reader(read_half, tx).await;
+        });
+
+        Self {
+            writer: write_half,
+            device_msg_rx: rx,
+            reader_task,
+            acked_sequences: HashSet::new(),
+            pending_clipboards: VecDeque::new(),
+            next_sequence: 1,
+        }
+    }
+
+    /// 后台读取设备消息（剪贴板与 ACK）。
+    async fn run_device_message_reader(
+        mut reader: OwnedReadHalf,
+        tx: UnboundedSender<DeviceMessage>,
+    ) {
+        loop {
+            let mut ty = [0u8; 1];
+            if let Err(e) = reader.read_exact(&mut ty).await {
+                debug!("[控制通道] 设备消息读取结束: {}", e);
+                break;
+            }
+
+            match ty[0] {
+                // DEVICE_MSG_TYPE_CLIPBOARD
+                0 => {
+                    let mut len_buf = [0u8; 4];
+                    if let Err(e) = reader.read_exact(&mut len_buf).await {
+                        warn!("[控制通道] 读取剪贴板长度失败: {}", e);
+                        break;
+                    }
+                    let text_len = u32::from_be_bytes(len_buf) as usize;
+                    let mut text_buf = vec![0u8; text_len];
+                    if let Err(e) = reader.read_exact(&mut text_buf).await {
+                        warn!("[控制通道] 读取剪贴板内容失败: {}", e);
+                        break;
+                    }
+                    let text = String::from_utf8_lossy(&text_buf).to_string();
+                    let _ = tx.send(DeviceMessage::Clipboard(text));
+                }
+                // DEVICE_MSG_TYPE_ACK_CLIPBOARD
+                1 => {
+                    let mut seq_buf = [0u8; 8];
+                    if let Err(e) = reader.read_exact(&mut seq_buf).await {
+                        warn!("[控制通道] 读取剪贴板 ACK 失败: {}", e);
+                        break;
+                    }
+                    let sequence = u64::from_be_bytes(seq_buf);
+                    let _ = tx.send(DeviceMessage::AckClipboard(sequence));
+                }
+                // DEVICE_MSG_TYPE_UHID_OUTPUT（当前仅跳过，避免协议流错位）
+                2 => {
+                    let mut header = [0u8; 4];
+                    if let Err(e) = reader.read_exact(&mut header).await {
+                        warn!("[控制通道] 读取 UHID 输出头失败: {}", e);
+                        break;
+                    }
+                    let size = u16::from_be_bytes([header[2], header[3]]) as usize;
+                    let mut payload = vec![0u8; size];
+                    if let Err(e) = reader.read_exact(&mut payload).await {
+                        warn!("[控制通道] 读取 UHID 输出数据失败: {}", e);
+                        break;
+                    }
+                }
+                other => {
+                    warn!("[控制通道] 收到未知设备消息类型: {}", other);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 拉取控制通道中的设备消息并更新本地缓存。
+    pub fn poll_device_messages(&mut self) {
+        while let Ok(msg) = self.device_msg_rx.try_recv() {
+            match msg {
+                DeviceMessage::Clipboard(text) => {
+                    self.pending_clipboards.push_back(text);
+                }
+                DeviceMessage::AckClipboard(seq) => {
+                    self.acked_sequences.insert(seq);
+                }
+            }
+        }
+    }
+
+    /// 取出设备侧剪贴板更新（由 Session 转发到上层）。
+    pub fn take_clipboard_updates(&mut self) -> Vec<String> {
+        self.poll_device_messages();
+        let mut out = Vec::with_capacity(self.pending_clipboards.len());
+        while let Some(text) = self.pending_clipboards.pop_front() {
+            out.push(text);
+        }
+        out
+    }
+
+    fn alloc_sequence(&mut self) -> u64 {
+        let seq = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
+        seq
+    }
+
+    async fn wait_clipboard_ack(&mut self, sequence: u64, timeout: Duration) -> Result<()> {
+        self.poll_device_messages();
+        if self.acked_sequences.remove(&sequence) {
+            return Ok(());
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ScrcpyError::Network(format!(
+                    "等待剪贴板 ACK 超时: sequence={}",
+                    sequence
+                )));
+            }
+            let remain = deadline - now;
+            match tokio::time::timeout(remain, self.device_msg_rx.recv()).await {
+                Ok(Some(DeviceMessage::AckClipboard(seq))) => {
+                    if seq == sequence {
+                        return Ok(());
+                    }
+                    self.acked_sequences.insert(seq);
+                }
+                Ok(Some(DeviceMessage::Clipboard(text))) => {
+                    self.pending_clipboards.push_back(text);
+                }
+                Ok(None) => {
+                    return Err(ScrcpyError::Network(
+                        "控制通道设备消息接收器已关闭".to_string(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ScrcpyError::Network(format!(
+                        "等待剪贴板 ACK 超时: sequence={}",
+                        sequence
+                    )));
+                }
+            }
+        }
     }
 
     /// 发送触摸事件到设备
@@ -246,7 +414,7 @@ impl ControlChannel {
             msg.len(), event.action, x_fixed, event.width, y_fixed, event.height, event.pressure, pressure_u16, action_button, buttons);
         debug!("   Complete message bytes: {:02x?}", msg);
 
-        match self.stream.write_all(&msg).await {
+        match self.writer.write_all(&msg).await {
             Ok(_) => {
                 debug!("✅ TCP write successful");
             }
@@ -256,7 +424,7 @@ impl ControlChannel {
             }
         }
 
-        match self.stream.flush().await {
+        match self.writer.flush().await {
             Ok(_) => {
                 debug!("✅ TCP flush successful");
             }
@@ -294,10 +462,10 @@ impl ControlChannel {
 
         debug!("📤 Key message ({} bytes): {:02x?}", msg.len(), msg);
 
-        self.stream.write_all(&msg).await
+        self.writer.write_all(&msg).await
             .map_err(|e| ScrcpyError::Network(format!("Failed to send key event: {}", e)))?;
 
-        self.stream.flush().await
+        self.writer.flush().await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
@@ -358,10 +526,10 @@ impl ControlChannel {
         debug!("📤 Scroll message ({} bytes): hscroll_i16={}, vscroll_i16={}, hex={:02x?}",
             msg.len(), hscroll_i16, vscroll_i16, msg);
 
-        self.stream.write_all(&msg).await
+        self.writer.write_all(&msg).await
             .map_err(|e| ScrcpyError::Network(format!("Failed to send scroll event: {}", e)))?;
 
-        self.stream.flush().await
+        self.writer.flush().await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
@@ -431,10 +599,10 @@ impl ControlChannel {
 
         debug!("📤 Text message ({} bytes)", msg.len());
 
-        self.stream.write_all(&msg).await
+        self.writer.write_all(&msg).await
             .map_err(|e| ScrcpyError::Network(format!("Failed to send text: {}", e)))?;
 
-        self.stream.flush().await
+        self.writer.flush().await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
@@ -452,8 +620,11 @@ impl ControlChannel {
         // 1. 消息类型 (1 byte) = SetClipboard (9)
         msg.push(ControlMessageType::SetClipboard as u8);
 
-        // 2. sequence (8 bytes, Big Endian) - 用于同步，这里使用0
-        msg.extend_from_slice(&0u64.to_be_bytes());
+        // 2. sequence (8 bytes, Big Endian)
+        // - paste=false：走 ACK 同步，确保后续 Ctrl+V 不会粘贴旧内容；
+        // - paste=true：不依赖 ACK，保持即时触发语义。
+        let sequence = if paste { 0 } else { self.alloc_sequence() };
+        msg.extend_from_slice(&sequence.to_be_bytes());
 
         // 3. paste标志 (1 byte) - 是否模拟粘贴操作
         msg.push(if paste { 1 } else { 0 });
@@ -466,11 +637,17 @@ impl ControlChannel {
 
         debug!("📤 Clipboard message ({} bytes)", msg.len());
 
-        self.stream.write_all(&msg).await
+        self.writer.write_all(&msg).await
             .map_err(|e| ScrcpyError::Network(format!("Failed to set clipboard: {}", e)))?;
 
-        self.stream.flush().await
+        self.writer.flush().await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
+
+        if !paste {
+            self.wait_clipboard_ack(sequence, Duration::from_millis(500))
+                .await?;
+            debug!("[控制通道] 已收到剪贴板 ACK: sequence={}", sequence);
+        }
 
         Ok(())
     }
@@ -487,12 +664,12 @@ impl ControlChannel {
     pub async fn set_display_power(&mut self, on: bool) -> Result<()> {
         let msg = [ControlMessageType::SetDisplayPower as u8, if on { 1 } else { 0 }];
 
-        self.stream
+        self.writer
             .write_all(&msg)
             .await
             .map_err(|e| ScrcpyError::Network(format!("Failed to set display power: {}", e)))?;
 
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
@@ -510,11 +687,11 @@ impl ControlChannel {
     /// - 若需要“绝对方向”，应由上层结合当前分辨率/旋转状态决定是否发送。
     pub async fn send_rotate_device(&mut self) -> Result<()> {
         let msg = [ControlMessageType::RotateDevice as u8];
-        self.stream
+        self.writer
             .write_all(&msg)
             .await
             .map_err(|e| ScrcpyError::Network(format!("Failed to rotate device: {}", e)))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
@@ -527,11 +704,11 @@ impl ControlChannel {
     /// - 仅 1 字节类型值 `TYPE_RESET_VIDEO(17)`，无额外负载。
     pub async fn send_reset_video(&mut self) -> Result<()> {
         let msg = [ControlMessageType::ResetVideo as u8];
-        self.stream
+        self.writer
             .write_all(&msg)
             .await
             .map_err(|e| ScrcpyError::Network(format!("Failed to request reset video: {}", e)))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
@@ -570,11 +747,11 @@ impl ControlChannel {
 
         info!("[UHID] 创建键盘设备: id={}, vendor_id={}, product_id={}, name_len={}, report_desc_len={}", id, vendor_id, product_id, name_bytes.len(), report_desc.len());
 
-        self.stream
+        self.writer
             .write_all(&msg)
             .await
             .map_err(|e| ScrcpyError::Network(format!("创建 UHID 键盘失败: {}", e)))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
@@ -599,11 +776,11 @@ impl ControlChannel {
 
         debug!("[UHID] 发送输入报告: id={}, data_len={}", id, data.len());
 
-        self.stream
+        self.writer
             .write_all(&msg)
             .await
             .map_err(|e| ScrcpyError::Network(format!("发送 UHID 输入报告失败: {}", e)))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
@@ -622,16 +799,22 @@ impl ControlChannel {
 
         info!("[UHID] 销毁设备: id={}", id);
 
-        self.stream
+        self.writer
             .write_all(&msg)
             .await
             .map_err(|e| ScrcpyError::Network(format!("销毁 UHID 设备失败: {}", e)))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
+    }
+}
+
+impl Drop for ControlChannel {
+    fn drop(&mut self) {
+        self.reader_task.abort();
     }
 }
 

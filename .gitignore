@@ -22,3 +22,5 @@ lib
 .idea/
 .claude/
 *.log
+Cargo.lock
+Cargo.lock

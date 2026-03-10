@@ -61,6 +61,16 @@ impl UhidKeyboardState {
         }
     }
 
+    /// 判断给定 Android keycode 是否可由当前 UHID 映射处理。
+    ///
+    /// 说明：
+    /// - true：可走 UHID 报告；
+    /// - false：应由上层回退到 Inject keycode 通道。
+    pub fn supports_android_keycode(keycode: u32) -> bool {
+        android_modifier_keycode_to_mask(keycode).is_some()
+            || android_keycode_to_hid_usage(keycode).is_some()
+    }
+
     /// 清空全部按键状态。
     ///
     /// 常用于：
