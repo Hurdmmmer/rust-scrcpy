@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "rust-scrcpy"
 version = "2.2.0"
 edition = "2021"
@@ -8,8 +8,7 @@ authors = ["zzzzyg"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 
 [lib]
-# Flutter 通过 FFI 加载动态库，必须输出 cdylib。
-# 同时保留 rlib，便于本工程内部测试与复用。
+# Flutter 通过 FFI 加载动态库，保留 rlib 便于本地测试。
 name = "rust_scrcpy"
 crate-type = ["cdylib", "rlib"]
 
@@ -21,6 +20,7 @@ frb = []
 [dependencies]
 # 异步运行时
 tokio = { version = "1.42", features = ["full"] }
+async-trait = "0.1"
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }
@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 thiserror = "2.0"
 
-# FFmpeg 解码（用于 test_full_pipeline 回归示例）
+# FFmpeg 解码（用于示例与回归验证）
 ffmpeg-next = "8"
 once_cell = "1.20"
 flutter_rust_bridge = "=2.11.1"

@@ -110,9 +110,11 @@ impl ScrcpyClient {
 
         let control = ControlChannel::new(control_socket);
         let video_stream = FramedVideoStreamReader::new(video_socket);
-        let mut session = Session::from_connected(conn, control, video_stream);
+        let mut session = Session::from_connected(conn, control, video_stream, self.config.input_mode);
 
         self.apply_startup_policies_after_session(&mut session).await?;
+        // 连接完成后预热输入后端，强制 UHID 场景避免首键触发时再创建设备。
+        session.warmup_input_backend().await?;
         Ok(session)
     }
 

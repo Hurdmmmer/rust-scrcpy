@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::scrcpy::input::ScrcpyInputMode;
 
 /// Scrcpy 客户端配置。
 ///
@@ -34,6 +35,8 @@ pub struct ScrcpyClientConfig {
     pub stay_awake: bool,
     /// scrcpy server 日志级别（例如 info/debug）。
     pub scrcpy_log_level: String,
+    /// 输入后端模式（Inject/UHID/Auto）。
+    pub input_mode: ScrcpyInputMode,
 }
 
 impl Default for ScrcpyClientConfig {
@@ -53,7 +56,9 @@ impl Default for ScrcpyClientConfig {
             turn_screen_off: false,
             stay_awake: false,
             scrcpy_log_level: "info".to_string(),
+            input_mode: ScrcpyInputMode::Uhid,
         }
     }
 }
+
 

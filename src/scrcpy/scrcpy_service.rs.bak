@@ -1,10 +1,6 @@
-//! Scrcpy 新架构服务入口（供 Flutter API 内部调用）。
-//!
-//! 关键约束：
-//! - 不改变 `gh_api/flutter_api.rs` 的对外函数签名；
-//! - 不改变 `flutter_callback_register` 的 C ABI 注册接口；
-//! - 全部内部逻辑走 `scrcpy/*` 新目录。
-
+﻿//! Scrcpy 鏂版灦鏋勬湇鍔″叆鍙ｏ紙渚?Flutter API 鍐呴儴璋冪敤锛夈€?//!
+//! 鍏抽敭绾︽潫锛?//! - 涓嶆敼鍙?`gh_api/flutter_api.rs` 鐨勫澶栧嚱鏁扮鍚嶏紱
+//! - 涓嶆敼鍙?`flutter_callback_register` 鐨?C ABI 娉ㄥ唽鎺ュ彛锛?//! - 鍏ㄩ儴鍐呴儴閫昏緫璧?`scrcpy/*` 鏂扮洰褰曘€?
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,33 +34,20 @@ use crate::scrcpy::runtime::{ScrcpyCoreRuntime, ScrcpyDecodeConfig};
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// 会话 ID 递增计数器。
-///
-/// 设计目的：
-/// - 对外暴露的会话 ID 只要求在进程内唯一，不要求跨进程稳定；
-/// - 使用原子递增可以避免全局锁竞争，并且实现简单可预测。
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+/// 浼氳瘽 ID 閫掑璁℃暟鍣ㄣ€?///
+/// 璁捐鐩殑锛?/// - 瀵瑰鏆撮湶鐨勪細璇?ID 鍙姹傚湪杩涚▼鍐呭敮涓€锛屼笉瑕佹眰璺ㄨ繘绋嬬ǔ瀹氾紱
+/// - 浣跨敤鍘熷瓙閫掑鍙互閬垮厤鍏ㄥ眬閿佺珵浜夛紝骞朵笖瀹炵幇绠€鍗曞彲棰勬祴銆?static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// 全局会话表。
-///
-/// 表中保存 API 层会话状态，键为 `session_id`。
-/// 这里不做持久化，进程退出后会话自然失效。
-static API_SESSIONS: Lazy<Mutex<HashMap<String, ApiSession>>> =
+/// 鍏ㄥ眬浼氳瘽琛ㄣ€?///
+/// 琛ㄤ腑淇濆瓨 API 灞備細璇濈姸鎬侊紝閿负 `session_id`銆?/// 杩欓噷涓嶅仛鎸佷箙鍖栵紝杩涚▼閫€鍑哄悗浼氳瘽鑷劧澶辨晥銆?static API_SESSIONS: Lazy<Mutex<HashMap<String, ApiSession>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// 日志初始化标记。
-///
-/// tracing subscriber 在同一进程里只能初始化一次，
-/// 这里用布尔位保证 `setup_logger` 幂等。
-static LOGGER_READY: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+/// 鏃ュ織鍒濆鍖栨爣璁般€?///
+/// tracing subscriber 鍦ㄥ悓涓€杩涚▼閲屽彧鑳藉垵濮嬪寲涓€娆★紝
+/// 杩欓噷鐢ㄥ竷灏斾綅淇濊瘉 `setup_logger` 骞傜瓑銆?static LOGGER_READY: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
-/// 后台 worker 控制命令。
-///
-/// 架构说明：
-/// - API 线程不直接触碰运行时对象；
-/// - 所有控制行为都转成命令，通过通道投递给会话 worker；
-/// - 这样可以把并发访问收敛到单线程，减少锁和状态竞争。
-enum RuntimeCommand {
+/// 鍚庡彴 worker 鎺у埗鍛戒护銆?///
+/// 鏋舵瀯璇存槑锛?/// - API 绾跨▼涓嶇洿鎺ヨЕ纰拌繍琛屾椂瀵硅薄锛?/// - 鎵€鏈夋帶鍒惰涓洪兘杞垚鍛戒护锛岄€氳繃閫氶亾鎶曢€掔粰浼氳瘽 worker锛?/// - 杩欐牱鍙互鎶婂苟鍙戣闂敹鏁涘埌鍗曠嚎绋嬶紝鍑忓皯閿佸拰鐘舵€佺珵浜夈€?enum RuntimeCommand {
     Stop,
     Touch(TouchEvent),
     Key(KeyEvent),
@@ -76,58 +59,42 @@ enum RuntimeCommand {
     RequestIdr,
 }
 
-/// 单会话后台 worker。
-///
-/// 字段语义：
-/// - `tx`：API -> worker 命令通道；
-/// - `running`：跨线程可见的运行标记，用于快速退出；
-/// - `stats`：最近一次统计快照，供 API 线程读取；
-/// - `join`：线程句柄，用于 stop/dispose 阶段阻塞回收。
-struct RuntimeWorker {
+/// 鍗曚細璇濆悗鍙?worker銆?///
+/// 瀛楁璇箟锛?/// - `tx`锛欰PI -> worker 鍛戒护閫氶亾锛?/// - `running`锛氳法绾跨▼鍙鐨勮繍琛屾爣璁帮紝鐢ㄤ簬蹇€熼€€鍑猴紱
+/// - `stats`锛氭渶杩戜竴娆＄粺璁″揩鐓э紝渚?API 绾跨▼璇诲彇锛?/// - `join`锛氱嚎绋嬪彞鏌勶紝鐢ㄤ簬 stop/dispose 闃舵闃诲鍥炴敹銆?struct RuntimeWorker {
     tx: Sender<RuntimeCommand>,
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<SessionStats>>,
     join: Option<JoinHandle<()>>,
 }
 
-/// API 层会话状态。
-///
-/// 该结构只保存“配置与运行句柄”，不存放重型 runtime 对象，
-/// 避免在全局会话表中持有不可 Send 的复杂状态。
-struct ApiSession {
+/// API 灞備細璇濈姸鎬併€?///
+/// 璇ョ粨鏋勫彧淇濆瓨鈥滈厤缃笌杩愯鍙ユ焺鈥濓紝涓嶅瓨鏀鹃噸鍨?runtime 瀵硅薄锛?/// 閬垮厤鍦ㄥ叏灞€浼氳瘽琛ㄤ腑鎸佹湁涓嶅彲 Send 鐨勫鏉傜姸鎬併€?struct ApiSession {
     config: SessionConfig,
     decoder_mode: DecoderMode,
     render_pipeline_mode: RenderPipelineMode,
     worker: Option<RuntimeWorker>,
 }
 
-/// 获取全局会话表互斥锁。
-///
-/// 统一在这里转换 poison 错误，避免每个调用点重复错误映射代码。
-fn lock_sessions() -> Result<MutexGuard<'static, HashMap<String, ApiSession>>> {
+/// 鑾峰彇鍏ㄥ眬浼氳瘽琛ㄤ簰鏂ラ攣銆?///
+/// 缁熶竴鍦ㄨ繖閲岃浆鎹?poison 閿欒锛岄伩鍏嶆瘡涓皟鐢ㄧ偣閲嶅閿欒鏄犲皠浠ｇ爜銆?fn lock_sessions() -> Result<MutexGuard<'static, HashMap<String, ApiSession>>> {
     API_SESSIONS
         .lock()
         .map_err(|_| ScrcpyError::Other("api session map poisoned".to_string()))
 }
 
-/// 生成新会话 ID。
-///
-/// 返回格式固定为 `sess-{number}`，便于日志检索与排查。
-fn new_session_id() -> String {
+/// 鐢熸垚鏂颁細璇?ID銆?///
+/// 杩斿洖鏍煎紡鍥哄畾涓?`sess-{number}`锛屼究浜庢棩蹇楁绱笌鎺掓煡銆?fn new_session_id() -> String {
     format!("sess-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-/// 统一构造“会话不存在”错误。
-///
-/// 这样可以保证不同 API 的错误文案一致，减少前端判断分支。
-fn invalid_session_error(session_id: &str) -> ScrcpyError {
+/// 缁熶竴鏋勯€犫€滀細璇濅笉瀛樺湪鈥濋敊璇€?///
+/// 杩欐牱鍙互淇濊瘉涓嶅悓 API 鐨勯敊璇枃妗堜竴鑷达紝鍑忓皯鍓嶇鍒ゆ柇鍒嗘敮銆?fn invalid_session_error(session_id: &str) -> ScrcpyError {
     ScrcpyError::Other(format!("invalid session id: {}", session_id))
 }
 
-/// 将业务日志级别映射为 tracing 级别。
-///
-/// 该映射是 1:1 语义映射，不做降级/升级转换。
-fn map_level(level: LogLevel) -> Level {
+/// 灏嗕笟鍔℃棩蹇楃骇鍒槧灏勪负 tracing 绾у埆銆?///
+/// 璇ユ槧灏勬槸 1:1 璇箟鏄犲皠锛屼笉鍋氶檷绾?鍗囩骇杞崲銆?fn map_level(level: LogLevel) -> Level {
     match level {
         LogLevel::Trace => Level::TRACE,
         LogLevel::Debug => Level::DEBUG,
@@ -137,10 +104,8 @@ fn map_level(level: LogLevel) -> Level {
     }
 }
 
-/// 创建默认统计对象。
-///
-/// 在会话尚未启动或统计尚不可用时返回，避免 API 侧出现空值判断。
-fn default_stats() -> SessionStats {
+/// 鍒涘缓榛樿缁熻瀵硅薄銆?///
+/// 鍦ㄤ細璇濆皻鏈惎鍔ㄦ垨缁熻灏氫笉鍙敤鏃惰繑鍥烇紝閬垮厤 API 渚у嚭鐜扮┖鍊煎垽鏂€?fn default_stats() -> SessionStats {
     SessionStats {
         fps: 0.0,
         decode_latency_ms: 0,
@@ -150,12 +115,8 @@ fn default_stats() -> SessionStats {
     }
 }
 
-/// 将 Flutter API 会话配置映射为新架构客户端配置。
-///
-/// 约束：
-/// - 字段语义尽量保持直通，避免隐式换算；
-/// - 仅在字段名不同场景下做机械映射，避免引入配置漂移。
-fn map_client_config(config: &SessionConfig) -> ScrcpyClientConfig {
+/// 灏?Flutter API 浼氳瘽閰嶇疆鏄犲皠涓烘柊鏋舵瀯瀹㈡埛绔厤缃€?///
+/// 绾︽潫锛?/// - 瀛楁璇箟灏介噺淇濇寔鐩撮€氾紝閬垮厤闅愬紡鎹㈢畻锛?/// - 浠呭湪瀛楁鍚嶄笉鍚屽満鏅笅鍋氭満姊版槧灏勶紝閬垮厤寮曞叆閰嶇疆婕傜Щ銆?fn map_client_config(config: &SessionConfig) -> ScrcpyClientConfig {
     ScrcpyClientConfig {
         adb_path: config.adb_path.clone(),
         server_path: config.server_path.clone(),
@@ -170,17 +131,13 @@ fn map_client_config(config: &SessionConfig) -> ScrcpyClientConfig {
         turn_screen_off: config.turn_screen_off,
         stay_awake: config.stay_awake,
         scrcpy_log_level: config.scrcpy_verbosity.clone(),
-        // 按产品要求强制使用 UHID 键盘输入。
-        input_mode: ScrcpyInputMode::Uhid,
+        // 当前 API 尚未透传输入后端配置，先走自动模式（优先UHID，失败回退Inject）。
+        input_mode: ScrcpyInputMode::Auto,
     }
 }
 
-/// 将 API 层解码/渲染模式映射为新架构 decode pipeline 配置。
-///
-/// 当前策略：
-/// - `Original` 走 GPU 共享句柄链路；
-/// - `CpuPixelBufferV2` 走 CPU BGRA 链路。
-fn map_decode_config(
+/// 灏?API 灞傝В鐮?娓叉煋妯″紡鏄犲皠涓烘柊鏋舵瀯 decode pipeline 閰嶇疆銆?///
+/// 褰撳墠绛栫暐锛?/// - `Original` 璧?GPU 鍏变韩鍙ユ焺閾捐矾锛?/// - `CpuPixelBufferV2` 璧?CPU BGRA 閾捐矾銆?fn map_decode_config(
     decoder_mode: DecoderMode,
     render_pipeline_mode: RenderPipelineMode,
 ) -> ScrcpyDecodeConfig {
@@ -193,11 +150,8 @@ fn map_decode_config(
     cfg
 }
 
-/// 将 Flutter API 侧触摸事件映射为新 runtime 控制事件。
-///
-/// 这里按协议 action 数值做映射，不直接依赖历史目录枚举类型。
-/// 当 action 非法时，默认降级为 `Move`，避免输入异常导致线程崩溃。
-fn map_touch_event(event: TouchEvent) -> AndroidTouchEvent {
+/// 灏?Flutter API 渚цЕ鎽镐簨浠舵槧灏勪负鏂?runtime 鎺у埗浜嬩欢銆?///
+/// 杩欓噷鎸夊崗璁?action 鏁板€煎仛鏄犲皠锛屼笉鐩存帴渚濊禆鍘嗗彶鐩綍鏋氫妇绫诲瀷銆?/// 褰?action 闈炴硶鏃讹紝榛樿闄嶇骇涓?`Move`锛岄伩鍏嶈緭鍏ュ紓甯稿鑷寸嚎绋嬪穿婧冦€?fn map_touch_event(event: TouchEvent) -> AndroidTouchEvent {
     let action = match event.action as u8 {
         0 => AndroidMotionEventAction::Down,
         1 => AndroidMotionEventAction::Up,
@@ -222,10 +176,8 @@ fn map_touch_event(event: TouchEvent) -> AndroidTouchEvent {
     }
 }
 
-/// 将 Flutter API 侧按键事件映射为新 runtime 控制事件。
-///
-/// 当 action 非法时，默认降级为 `Down`，保证控制通道消息仍可发送。
-fn map_key_event(event: KeyEvent) -> AndroidKeyEvent {
+/// 灏?Flutter API 渚ф寜閿簨浠舵槧灏勪负鏂?runtime 鎺у埗浜嬩欢銆?///
+/// 褰?action 闈炴硶鏃讹紝榛樿闄嶇骇涓?`Down`锛屼繚璇佹帶鍒堕€氶亾娑堟伅浠嶅彲鍙戦€併€?fn map_key_event(event: KeyEvent) -> AndroidKeyEvent {
     let action = match event.action as u8 {
         0 => AndroidKeyEventAction::Down,
         1 => AndroidKeyEventAction::Up,
@@ -239,10 +191,8 @@ fn map_key_event(event: KeyEvent) -> AndroidKeyEvent {
     }
 }
 
-/// 将 Flutter API 侧滚轮事件映射为新 runtime 控制事件。
-///
-/// 该函数不做坐标系换算，只做结构搬运，换算由控制层处理。
-fn map_scroll_event(event: ScrollEvent) -> AndroidScrollEvent {
+/// 灏?Flutter API 渚ф粴杞簨浠舵槧灏勪负鏂?runtime 鎺у埗浜嬩欢銆?///
+/// 璇ュ嚱鏁颁笉鍋氬潗鏍囩郴鎹㈢畻锛屽彧鍋氱粨鏋勬惉杩愶紝鎹㈢畻鐢辨帶鍒跺眰澶勭悊銆?fn map_scroll_event(event: ScrollEvent) -> AndroidScrollEvent {
     AndroidScrollEvent {
         x: event.x,
         y: event.y,
@@ -253,10 +203,8 @@ fn map_scroll_event(event: ScrollEvent) -> AndroidScrollEvent {
     }
 }
 
-/// 将语义系统键映射为 Android keycode。
-///
-/// `RotateScreen` 暂无直接 keycode 对应，返回 `None`。
-fn system_key_to_keycode(key: SystemKey) -> Option<u32> {
+/// 灏嗚涔夌郴缁熼敭鏄犲皠涓?Android keycode銆?///
+/// `RotateScreen` 鏆傛棤鐩存帴 keycode 瀵瑰簲锛岃繑鍥?`None`銆?fn system_key_to_keycode(key: SystemKey) -> Option<u32> {
     match key {
         SystemKey::Home => Some(3),
         SystemKey::Back => Some(4),
@@ -268,24 +216,15 @@ fn system_key_to_keycode(key: SystemKey) -> Option<u32> {
     }
 }
 
-/// 把会话事件序列化为 JSON，并投递到 Flutter 回调注册器。
-///
-/// 失败策略：
-/// - 序列化失败时静默忽略（不 panic、不阻断主流程）；
-/// - 原因是事件通知属于旁路能力，不应拖垮主会话链路。
-fn notify_session_event_json(session_id: &str, event: &SessionEvent) {
+/// 鎶婁細璇濅簨浠跺簭鍒楀寲涓?JSON锛屽苟鎶曢€掑埌 Flutter 鍥炶皟娉ㄥ唽鍣ㄣ€?///
+/// 澶辫触绛栫暐锛?/// - 搴忓垪鍖栧け璐ユ椂闈欓粯蹇界暐锛堜笉 panic銆佷笉闃绘柇涓绘祦绋嬶級锛?/// - 鍘熷洜鏄簨浠堕€氱煡灞炰簬鏃佽矾鑳藉姏锛屼笉搴旀嫋鍨富浼氳瘽閾捐矾銆?fn notify_session_event_json(session_id: &str, event: &SessionEvent) {
     if let Ok(payload) = serde_json::to_vec(event) {
         flutter_callback_register::notify_session_event(session_id, &payload);
     }
 }
 
-/// 直接执行 adb 命令并返回 stdout 文本。
-///
-/// 行为约束：
-/// - stdout/stderr 都捕获，便于失败诊断；
-/// - 非零退出码统一映射为 `ScrcpyError::Other`；
-/// - Windows 下关闭弹窗，避免影响桌面应用体验。
-async fn adb_execute(adb_path: &str, args: &[&str]) -> Result<String> {
+/// 鐩存帴鎵ц adb 鍛戒护骞惰繑鍥?stdout 鏂囨湰銆?///
+/// 琛屼负绾︽潫锛?/// - stdout/stderr 閮芥崟鑾凤紝渚夸簬澶辫触璇婃柇锛?/// - 闈為浂閫€鍑虹爜缁熶竴鏄犲皠涓?`ScrcpyError::Other`锛?/// - Windows 涓嬪叧闂脊绐楋紝閬垮厤褰卞搷妗岄潰搴旂敤浣撻獙銆?async fn adb_execute(adb_path: &str, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new(adb_path);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
@@ -306,18 +245,14 @@ async fn adb_execute(adb_path: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// 执行设备方向模式切换。
-///
-/// 该能力必须走 adb 系统设置，而不是仅发送事件，
-/// 否则会出现“上层看到方向变化事件，但设备方向没有变化”的假状态。
-async fn adb_set_orientation_mode(
+/// 鎵ц璁惧鏂瑰悜妯″紡鍒囨崲銆?///
+/// 璇ヨ兘鍔涘繀椤昏蛋 adb 绯荤粺璁剧疆锛岃€屼笉鏄粎鍙戦€佷簨浠讹紝
+/// 鍚﹀垯浼氬嚭鐜扳€滀笂灞傜湅鍒版柟鍚戝彉鍖栦簨浠讹紝浣嗚澶囨柟鍚戞病鏈夊彉鍖栤€濈殑鍋囩姸鎬併€?async fn adb_set_orientation_mode(
     adb_path: &str,
     device_id: &str,
     mode: OrientationMode,
 ) -> Result<()> {
-    // Android 11+/12+/13 上，`cmd window user-rotation` 通常比直接写 settings 更可靠。
-    // 这里采用“新命令优先，旧命令兜底”的策略，避免部分 ROM 上方向设置无效。
-    async fn adb_shell_try(adb_path: &str, device_id: &str, command: &str) -> Result<()> {
+    // Android 11+/12+/13 涓婏紝`cmd window user-rotation` 閫氬父姣旂洿鎺ュ啓 settings 鏇村彲闈犮€?    // 杩欓噷閲囩敤鈥滄柊鍛戒护浼樺厛锛屾棫鍛戒护鍏滃簳鈥濈殑绛栫暐锛岄伩鍏嶉儴鍒?ROM 涓婃柟鍚戣缃棤鏁堛€?    async fn adb_shell_try(adb_path: &str, device_id: &str, command: &str) -> Result<()> {
         let _ = adb_execute(adb_path, &["-s", device_id, "shell", command]).await?;
         Ok(())
     }
@@ -373,12 +308,10 @@ async fn adb_set_orientation_mode(
 
     Ok(())
 }
-/// 处理一条运行时命令。
-///
-/// 返回值语义：
-/// - `true`：继续运行；
-/// - `false`：收到停止信号，退出主循环。
-async fn handle_runtime_command(
+/// 澶勭悊涓€鏉¤繍琛屾椂鍛戒护銆?///
+/// 杩斿洖鍊艰涔夛細
+/// - `true`锛氱户缁繍琛岋紱
+/// - `false`锛氭敹鍒板仠姝俊鍙凤紝閫€鍑轰富寰幆銆?async fn handle_runtime_command(
     runtime: &mut ScrcpyCoreRuntime,
     session_id: &str,
     config: &SessionConfig,
@@ -426,7 +359,19 @@ async fn handle_runtime_command(
             true
         }
         RuntimeCommand::SetOrientation(mode) => {
-            match adb_set_orientation_mode(&config.adb_path, &config.device_id, mode).await {
+            let result = match mode {
+                OrientationMode::Portrait => {
+                    // 鍗忚璺緞锛氭寜鈥滃綋鍓嶅垎杈ㄧ巼鈥濆垽瀹氭槸鍚﹂渶瑕佸彂閫佷竴娆?RotateDevice銆?                    runtime.set_orientation_mode(session_id, true).await
+                }
+                OrientationMode::Landscape => {
+                    // 鍗忚璺緞锛氭寜鈥滃綋鍓嶅垎杈ㄧ巼鈥濆垽瀹氭槸鍚﹂渶瑕佸彂閫佷竴娆?RotateDevice銆?                    runtime.set_orientation_mode(session_id, false).await
+                }
+                OrientationMode::Auto => {
+                    // 鍗忚娌℃湁鈥滄仮澶嶈嚜鍔ㄦ棆杞€濆懡浠わ紝Auto 浠嶉€氳繃 adb 璁剧疆銆?                    adb_set_orientation_mode(&config.adb_path, &config.device_id, mode).await
+                }
+            };
+
+            match result {
                 Ok(_) => {
                     notify_session_event_json(
                         session_id,
@@ -437,6 +382,12 @@ async fn handle_runtime_command(
                     );
                 }
                 Err(e) => {
+                    warn!(
+                        "[鏂版湇鍔 璁剧疆鏂瑰悜澶辫触: session_id={}, mode={:?}, err={}",
+                        session_id,
+                        mode,
+                        e
+                    );
                     notify_session_event_json(
                         session_id,
                         &SessionEvent::Error {
@@ -454,36 +405,29 @@ async fn handle_runtime_command(
         }
     }
 }
-/// 启动单会话后台线程。
-///
-/// 线程职责：
-/// - 启动并持有 runtime；
-/// - 消费控制命令；
-/// - 持续解码泵送；
-/// - 检测重连信号并执行自动重连闭环。
-fn spawn_runtime_worker(
+/// 鍚姩鍗曚細璇濆悗鍙扮嚎绋嬨€?///
+/// 绾跨▼鑱岃矗锛?/// - 鍚姩骞舵寔鏈?runtime锛?/// - 娑堣垂鎺у埗鍛戒护锛?/// - 鎸佺画瑙ｇ爜娉甸€侊紱
+/// - 妫€娴嬮噸杩炰俊鍙峰苟鎵ц鑷姩閲嶈繛闂幆銆?fn spawn_runtime_worker(
     session_id: String,
     config: SessionConfig,
     decoder_mode: DecoderMode,
     render_pipeline_mode: RenderPipelineMode,
 ) -> RuntimeWorker {
-    // 使用有界异步通道，构建 Selector 风格事件循环。
-    // 目的：命令与视频解码竞争执行权，Stop 命令可快速抢占。
+    // 浣跨敤鏈夌晫寮傛閫氶亾锛屾瀯寤?Selector 椋庢牸浜嬩欢寰幆銆?
+    // 鐩殑锛氬懡浠や笌瑙嗛瑙ｇ爜绔炰簤鎵ц鏉冿紝Stop 鍛戒护鍙揩閫熸姠鍗犮€?
     let (tx, mut rx): (Sender<RuntimeCommand>, Receiver<RuntimeCommand>) = mpsc::channel(256);
     let running = Arc::new(AtomicBool::new(true));
     let stats = Arc::new(Mutex::new(default_stats()));
 
     let running_c = Arc::clone(&running);
     let stats_c = Arc::clone(&stats);
-
     let session_id_c = session_id.clone();
 
-    // 每个会话独占一个 worker 线程，避免跨会话状态串扰。
-    let join = std::thread::spawn(move || {
+    // 姣忎釜浼氳瘽鐙崰涓€涓?worker 绾跨▼锛岄伩鍏嶈法浼氳瘽鐘舵€佷覆鎵般€?    let join = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(v) => v,
             Err(e) => {
-                warn!("[新服务] 创建 tokio runtime 失败: {}", e);
+                warn!("[鏂版湇鍔 鍒涘缓 tokio runtime 澶辫触: {}", e);
                 notify_session_event_json(
                     &session_id_c,
                     &SessionEvent::Error {
@@ -501,8 +445,7 @@ fn spawn_runtime_worker(
             let mut runtime = ScrcpyCoreRuntime::new(client);
             runtime.set_decode_config(map_decode_config(decoder_mode, render_pipeline_mode));
 
-            // 会话启动前执行设备防休眠策略。
-            if config.stay_awake {
+            // 浼氳瘽鍚姩鍓嶆墽琛岃澶囬槻浼戠湢绛栫暐銆?            if config.stay_awake {
                 if let Err(e) = adb_execute(
                     &config.adb_path,
                     &["-s", &config.device_id, "shell", "svc power stayon true"],
@@ -510,39 +453,34 @@ fn spawn_runtime_worker(
                 .await
                 {
                     warn!(
-                        "[新服务] 设置设备防休眠失败（继续启动）: session_id={}, err={}",
+                        "[鏂版湇鍔 璁剧疆璁惧闃蹭紤鐪犲け璐ワ紙缁х画鍚姩锛? session_id={}, err={}",
                         session_id_c, e
                     );
                 }
             }
 
             if let Err(e) = runtime.start(session_id_c.clone()).await {
-                warn!("[新服务] 启动会话失败: session_id={}, err={}", session_id_c, e);
+                warn!("[鏂版湇鍔 鍚姩浼氳瘽澶辫触: session_id={}, err={}", session_id_c, e);
                 running_c.store(false, Ordering::Relaxed);
                 return;
             }
 
-            // 会话启动后按配置执行一次熄屏策略。
-            if config.turn_screen_off {
+            // 浼氳瘽鍚姩鍚庢寜閰嶇疆鎵ц涓€娆＄唲灞忕瓥鐣ャ€?            if config.turn_screen_off {
                 if let Err(e) = runtime.set_display_power(&session_id_c, false).await {
                     warn!(
-                        "[新服务] 会话启动后熄屏失败（不中断会话）: session_id={}, err={}",
+                        "[鏂版湇鍔 浼氳瘽鍚姩鍚庣唲灞忓け璐ワ紙涓嶄腑鏂細璇濓級: session_id={}, err={}",
                         session_id_c, e
                     );
                 }
             }
 
-            // Selector 风格主循环：
-            // - `rx.recv()` 代表控制面事件；
-            // - `decode_pump_once` 代表数据面事件；
-            // - 使用 `biased` 让控制面优先，确保 Stop 等命令更快生效；
-            // - 每轮只做一次解码泵送，避免单轮 budget 过大导致控制面饥饿。
-            while running_c.load(Ordering::Relaxed) {
+            // Selector 椋庢牸涓诲惊鐜細
+            // - `rx.recv()` 浠ｈ〃鎺у埗闈簨浠讹紱
+            // - `decode_pump` 浠ｈ〃鏁版嵁闈簨浠讹紱
+            // - Stop 鍛戒护鍙姠鍗犺В鐮佽矾寰勶紝蹇€熻繘鍏ヨ祫婧愬洖鏀躲€?            while running_c.load(Ordering::Relaxed) {
                 tokio::select! {
-                    biased;
                     cmd = rx.recv() => {
                         match cmd {
-                            // 处理每次收到的控制命令。键盘输入，剪切板操作等。
                             Some(cmd) => {
                                 let keep_running = handle_runtime_command(
                                     &mut runtime,
@@ -555,16 +493,14 @@ fn spawn_runtime_worker(
                                 }
                             }
                             None => {
-                                // 命令发送端已关闭，结束 worker。
-                                running_c.store(false, Ordering::Relaxed);
+                                // 鍛戒护鍙戦€佺宸插叧闂紝缁撴潫 worker銆?                                running_c.store(false, Ordering::Relaxed);
                             }
                         }
                     }
-                    // 开始读取Scrcpy Server 发送的视频帧。
-                    pump_result = runtime.decode_pump_once(&session_id_c) => {
+                    pump_result = runtime.decode_pump(&session_id_c, 8) => {
                         if let Err(e) = pump_result {
                             warn!(
-                                "[新服务] 解码泵送失败，结束会话: session_id={}, err={}",
+                                "[鏂版湇鍔 瑙ｇ爜娉甸€佸け璐ワ紝缁撴潫浼氳瘽: session_id={}, err={}",
                                 session_id_c, e
                             );
                             running_c.store(false, Ordering::Relaxed);
@@ -576,14 +512,13 @@ fn spawn_runtime_worker(
                     break;
                 }
 
-                // 自动重连闭环：stop -> 短等待 -> start。
-                if let Ok(true) = runtime.decode_reconnect_required(&session_id_c) {
-                    warn!("[新服务] 检测到重连信号，执行自动重连: session_id={}", session_id_c);
+                // 鑷姩閲嶈繛闂幆锛歴top -> 鐭瓑寰?-> start銆?                if let Ok(true) = runtime.decode_reconnect_required(&session_id_c) {
+                    warn!("[鏂版湇鍔 妫€娴嬪埌閲嶈繛淇″彿锛屾墽琛岃嚜鍔ㄩ噸杩? session_id={}", session_id_c);
                     let _ = runtime.stop(&session_id_c).await;
                     tokio::time::sleep(Duration::from_millis(120)).await;
                     if let Err(e) = runtime.start(session_id_c.clone()).await {
                         warn!(
-                            "[新服务] 自动重连失败，结束会话: session_id={}, err={}",
+                            "[鏂版湇鍔 鑷姩閲嶈繛澶辫触锛岀粨鏉熶細璇? session_id={}, err={}",
                             session_id_c, e
                         );
                         running_c.store(false, Ordering::Relaxed);
@@ -591,16 +526,14 @@ fn spawn_runtime_worker(
                     }
                 }
 
-                // 统计快照按循环覆盖写入，API 读取到的是最近一次可用值。
-                if let Ok(s) = runtime.session_stats(&session_id_c) {
+                // 缁熻蹇収鎸夊惊鐜鐩栧啓鍏ワ紝API 璇诲彇鍒扮殑鏄渶杩戜竴娆″彲鐢ㄥ€笺€?                if let Ok(s) = runtime.session_stats(&session_id_c) {
                     if let Ok(mut g) = stats_c.lock() {
                         *g = s;
                     }
                 }
             }
 
-            // Worker 线程收到退出信号后，会在退出前兜底停止 runtime，确保连接与资源被释放。
-            let _ = runtime.stop(&session_id_c).await;
+            // 閫€鍑哄墠鍏滃簳鍋滄 runtime锛岀‘淇濊繛鎺ヤ笌璧勬簮琚噴鏀俱€?            let _ = runtime.stop(&session_id_c).await;
             running_c.store(false, Ordering::Relaxed);
         });
     });
@@ -613,12 +546,9 @@ fn spawn_runtime_worker(
     }
 }
 
-/// 初始化 Rust 侧日志系统。
-///
-/// 幂等语义：
-/// - 同一进程只允许初始化一次；
-/// - 后续重复调用直接返回成功，不会重复安装 subscriber。
-pub async fn setup_logger(max_level: LogLevel) -> Result<()> {
+/// 鍒濆鍖?Rust 渚ф棩蹇楃郴缁熴€?///
+/// 骞傜瓑璇箟锛?/// - 鍚屼竴杩涚▼鍙厑璁稿垵濮嬪寲涓€娆★紱
+/// - 鍚庣画閲嶅璋冪敤鐩存帴杩斿洖鎴愬姛锛屼笉浼氶噸澶嶅畨瑁?subscriber銆?pub async fn setup_logger(max_level: LogLevel) -> Result<()> {
     let mut guard = LOGGER_READY
         .lock()
         .map_err(|_| ScrcpyError::Other("logger state lock poisoned".to_string()))?;
@@ -639,16 +569,13 @@ pub async fn setup_logger(max_level: LogLevel) -> Result<()> {
         .map_err(|e| ScrcpyError::Other(format!("setup logger failed: {}", e)))?;
 
     *guard = true;
-    info!("rust-scrcpy 新服务日志初始化完成, level={:?}", level);
+    info!("rust-scrcpy 鏂版湇鍔℃棩蹇楀垵濮嬪寲瀹屾垚, level={:?}", level);
     Ok(())
 }
 
-/// 通过 adb 列出在线设备。
-///
-/// 返回策略：
-/// - 只保留 `state == device` 的条目；
-/// - 型号、版本、分辨率在列表阶段不额外查询，避免慢查询阻塞接口。
-pub async fn list_devices(adb_path: String) -> Result<Vec<DeviceInfo>> {
+/// 閫氳繃 adb 鍒楀嚭鍦ㄧ嚎璁惧銆?///
+/// 杩斿洖绛栫暐锛?/// - 鍙繚鐣?`state == device` 鐨勬潯鐩紱
+/// - 鍨嬪彿銆佺増鏈€佸垎杈ㄧ巼鍦ㄥ垪琛ㄩ樁娈典笉棰濆鏌ヨ锛岄伩鍏嶆參鏌ヨ闃诲鎺ュ彛銆?pub async fn list_devices(adb_path: String) -> Result<Vec<DeviceInfo>> {
     let out = adb_execute(&adb_path, &["devices"]).await?;
     let mut devices = Vec::new();
     for line in out.lines() {
@@ -672,15 +599,12 @@ pub async fn list_devices(adb_path: String) -> Result<Vec<DeviceInfo>> {
     Ok(devices)
 }
 
-/// 查询单设备详细信息。
+/// 鏌ヨ鍗曡澶囪缁嗕俊鎭€?///
+/// 鏌ヨ鏉ユ簮锛?/// - 鍨嬪彿锛歚ro.product.model`
+/// - 绯荤粺鐗堟湰锛歚ro.build.version.release`
+/// - 鍒嗚鲸鐜囷細`wm size`
 ///
-/// 查询来源：
-/// - 型号：`ro.product.model`
-/// - 系统版本：`ro.build.version.release`
-/// - 分辨率：`wm size`
-///
-/// 任一字段查询失败时降级为默认值，而不是整接口失败。
-pub async fn get_device_info(adb_path: String, device_id: String) -> Result<DeviceInfo> {
+/// 浠讳竴瀛楁鏌ヨ澶辫触鏃堕檷绾т负榛樿鍊硷紝鑰屼笉鏄暣鎺ュ彛澶辫触銆?pub async fn get_device_info(adb_path: String, device_id: String) -> Result<DeviceInfo> {
     let model = adb_execute(&adb_path, &["-s", &device_id, "shell", "getprop ro.product.model"])
         .await
         .unwrap_or_else(|_| "Unknown".to_string())
@@ -711,10 +635,8 @@ pub async fn get_device_info(adb_path: String, device_id: String) -> Result<Devi
     })
 }
 
-/// 从 `wm size` 命令输出中提取宽高。
-///
-/// 兼容格式：
-/// - `Physical size: 1080x2400`
+/// 浠?`wm size` 鍛戒护杈撳嚭涓彁鍙栧楂樸€?///
+/// 鍏煎鏍煎紡锛?/// - `Physical size: 1080x2400`
 /// - `1080x2400`
 fn parse_wm_size(raw: &str) -> Option<(u32, u32)> {
     for line in raw.lines() {
@@ -731,12 +653,9 @@ fn parse_wm_size(raw: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// 解析 `WxH` 文本为宽高整数。
-///
-/// 返回 `None` 的场景：
-/// - 不是合法数字；
-/// - 宽或高为 0。
-fn parse_size_pair(value: &str) -> Option<(u32, u32)> {
+/// 瑙ｆ瀽 `WxH` 鏂囨湰涓哄楂樻暣鏁般€?///
+/// 杩斿洖 `None` 鐨勫満鏅細
+/// - 涓嶆槸鍚堟硶鏁板瓧锛?/// - 瀹芥垨楂樹负 0銆?fn parse_size_pair(value: &str) -> Option<(u32, u32)> {
     let mut parts = value.split('x');
     let w = parts.next()?.trim().parse::<u32>().ok()?;
     let h = parts.next()?.trim().parse::<u32>().ok()?;
@@ -746,13 +665,9 @@ fn parse_size_pair(value: &str) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// 创建会话（V1）。
-///
-/// 行为说明：
-/// - 只注册配置并返回 `session_id`；
-/// - 不会启动连接与解码线程；
-/// - 默认使用硬解优先 + 原始渲染链路。
-pub async fn create_session(config: SessionConfig) -> Result<String> {
+/// 鍒涘缓浼氳瘽锛圴1锛夈€?///
+/// 琛屼负璇存槑锛?/// - 鍙敞鍐岄厤缃苟杩斿洖 `session_id`锛?/// - 涓嶄細鍚姩杩炴帴涓庤В鐮佺嚎绋嬶紱
+/// - 榛樿浣跨敤纭В浼樺厛 + 鍘熷娓叉煋閾捐矾銆?pub async fn create_session(config: SessionConfig) -> Result<String> {
     let session_id = new_session_id();
     let session = ApiSession {
         config,
@@ -764,12 +679,10 @@ pub async fn create_session(config: SessionConfig) -> Result<String> {
     Ok(session_id)
 }
 
-/// 创建会话（V2）。
-///
-/// 与 V1 的差异：
-/// - 显式接收解码模式与渲染模式；
-/// - 其它行为与 V1 一致（仅注册，不启动）。
-pub async fn create_session_v2(config: SessionConfigV2) -> Result<String> {
+/// 鍒涘缓浼氳瘽锛圴2锛夈€?///
+/// 涓?V1 鐨勫樊寮傦細
+/// - 鏄惧紡鎺ユ敹瑙ｇ爜妯″紡涓庢覆鏌撴ā寮忥紱
+/// - 鍏跺畠琛屼负涓?V1 涓€鑷达紙浠呮敞鍐岋紝涓嶅惎鍔級銆?pub async fn create_session_v2(config: SessionConfigV2) -> Result<String> {
     let session_id = new_session_id();
     let session = ApiSession {
         config: config.base,
@@ -781,12 +694,9 @@ pub async fn create_session_v2(config: SessionConfigV2) -> Result<String> {
     Ok(session_id)
 }
 
-/// 启动会话。
-///
-/// 幂等语义：
-/// - 若会话已在运行，则直接返回成功；
-/// - 若会话存在但未运行，则拉起 worker。
-pub async fn start_session(session_id: String) -> Result<()> {
+/// 鍚姩浼氳瘽銆?///
+/// 骞傜瓑璇箟锛?/// - 鑻ヤ細璇濆凡鍦ㄨ繍琛岋紝鍒欑洿鎺ヨ繑鍥炴垚鍔燂紱
+/// - 鑻ヤ細璇濆瓨鍦ㄤ絾鏈繍琛岋紝鍒欐媺璧?worker銆?pub async fn start_session(session_id: String) -> Result<()> {
     let mut sessions = lock_sessions()?;
     let Some(session) = sessions.get_mut(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -808,13 +718,8 @@ pub async fn start_session(session_id: String) -> Result<()> {
     Ok(())
 }
 
-/// 停止会话。
-///
-/// 行为说明：
-/// - 向 worker 发送 `Stop` 命令；
-/// - 等待线程回收；
-/// - 保留会话配置，可再次 `start_session`。
-pub async fn stop_session(session_id: String) -> Result<()> {
+/// 鍋滄浼氳瘽銆?///
+/// 琛屼负璇存槑锛?/// - 鍚?worker 鍙戦€?`Stop` 鍛戒护锛?/// - 绛夊緟绾跨▼鍥炴敹锛?/// - 淇濈暀浼氳瘽閰嶇疆锛屽彲鍐嶆 `start_session`銆?pub async fn stop_session(session_id: String) -> Result<()> {
     let mut sessions = lock_sessions()?;
     let Some(session) = sessions.get_mut(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -831,12 +736,9 @@ pub async fn stop_session(session_id: String) -> Result<()> {
     Ok(())
 }
 
-/// 销毁会话。
-///
-/// 与 `stop_session` 的区别：
-/// - `dispose` 会从全局会话表移除该会话；
-/// - 移除后该 `session_id` 不可再次使用。
-pub async fn dispose_session(session_id: String) -> Result<()> {
+/// 閿€姣佷細璇濄€?///
+/// 涓?`stop_session` 鐨勫尯鍒細
+/// - `dispose` 浼氫粠鍏ㄥ眬浼氳瘽琛ㄧЩ闄よ浼氳瘽锛?/// - 绉婚櫎鍚庤 `session_id` 涓嶅彲鍐嶆浣跨敤銆?pub async fn dispose_session(session_id: String) -> Result<()> {
     let mut sessions = lock_sessions()?;
     let Some(mut session) = sessions.remove(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -852,10 +754,8 @@ pub async fn dispose_session(session_id: String) -> Result<()> {
     Ok(())
 }
 
-/// 投递触摸命令到会话 worker。
-///
-/// 该接口只负责命令投递，不保证设备端已经处理完成。
-pub async fn send_touch(session_id: String, event: TouchEvent) -> Result<()> {
+/// 鎶曢€掕Е鎽稿懡浠ゅ埌浼氳瘽 worker銆?///
+/// 璇ユ帴鍙ｅ彧璐熻矗鍛戒护鎶曢€掞紝涓嶄繚璇佽澶囩宸茬粡澶勭悊瀹屾垚銆?pub async fn send_touch(session_id: String, event: TouchEvent) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -870,8 +770,7 @@ pub async fn send_touch(session_id: String, event: TouchEvent) -> Result<()> {
     }
 }
 
-/// 投递按键命令到会话 worker。
-pub async fn send_key(session_id: String, event: KeyEvent) -> Result<()> {
+/// 鎶曢€掓寜閿懡浠ゅ埌浼氳瘽 worker銆?pub async fn send_key(session_id: String, event: KeyEvent) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -886,8 +785,7 @@ pub async fn send_key(session_id: String, event: KeyEvent) -> Result<()> {
     }
 }
 
-/// 投递滚轮命令到会话 worker。
-pub async fn send_scroll(session_id: String, event: ScrollEvent) -> Result<()> {
+/// 鎶曢€掓粴杞懡浠ゅ埌浼氳瘽 worker銆?pub async fn send_scroll(session_id: String, event: ScrollEvent) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -902,8 +800,7 @@ pub async fn send_scroll(session_id: String, event: ScrollEvent) -> Result<()> {
     }
 }
 
-/// 投递文本输入命令到会话 worker。
-pub async fn send_text(session_id: String, text: String) -> Result<()> {
+/// 鎶曢€掓枃鏈緭鍏ュ懡浠ゅ埌浼氳瘽 worker銆?pub async fn send_text(session_id: String, text: String) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -918,8 +815,7 @@ pub async fn send_text(session_id: String, text: String) -> Result<()> {
     }
 }
 
-/// 投递系统语义按键命令到会话 worker。
-pub async fn send_system_key(session_id: String, key: SystemKey) -> Result<()> {
+/// 鎶曢€掔郴缁熻涔夋寜閿懡浠ゅ埌浼氳瘽 worker銆?pub async fn send_system_key(session_id: String, key: SystemKey) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -934,10 +830,8 @@ pub async fn send_system_key(session_id: String, key: SystemKey) -> Result<()> {
     }
 }
 
-/// 投递剪贴板设置命令到会话 worker。
-///
-/// `paste=true` 时，设备端会尝试立刻执行一次粘贴动作。
-pub async fn set_clipboard(session_id: String, text: String, paste: bool) -> Result<()> {
+/// 鎶曢€掑壀璐存澘璁剧疆鍛戒护鍒颁細璇?worker銆?///
+/// `paste=true` 鏃讹紝璁惧绔細灏濊瘯绔嬪埢鎵ц涓€娆＄矘璐村姩浣溿€?pub async fn set_clipboard(session_id: String, text: String, paste: bool) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -952,10 +846,8 @@ pub async fn set_clipboard(session_id: String, text: String, paste: bool) -> Res
     }
 }
 
-/// 投递方向模式命令到会话 worker。
-///
-/// 当前实现会转为事件通知，方便上层统一消费方向状态变化。
-pub async fn set_orientation_mode(session_id: String, mode: OrientationMode) -> Result<()> {
+/// 鎶曢€掓柟鍚戞ā寮忓懡浠ゅ埌浼氳瘽 worker銆?///
+/// 褰撳墠瀹炵幇浼氳浆涓轰簨浠堕€氱煡锛屾柟渚夸笂灞傜粺涓€娑堣垂鏂瑰悜鐘舵€佸彉鍖栥€?pub async fn set_orientation_mode(session_id: String, mode: OrientationMode) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -970,10 +862,8 @@ pub async fn set_orientation_mode(session_id: String, mode: OrientationMode) -> 
     }
 }
 
-/// 投递 IDR 请求命令到会话 worker。
-///
-/// 用于在解码异常后请求关键帧，加快画面恢复。
-pub async fn request_idr(session_id: String) -> Result<()> {
+/// 鎶曢€?IDR 璇锋眰鍛戒护鍒颁細璇?worker銆?///
+/// 鐢ㄤ簬鍦ㄨВ鐮佸紓甯稿悗璇锋眰鍏抽敭甯э紝鍔犲揩鐢婚潰鎭㈠銆?pub async fn request_idr(session_id: String) -> Result<()> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -988,12 +878,9 @@ pub async fn request_idr(session_id: String) -> Result<()> {
     }
 }
 
-/// 获取会话统计快照。
-///
-/// 行为说明：
-/// - 已运行会话返回最近一次 worker 刷新的统计值；
-/// - 未运行会话返回默认统计对象，而不是错误。
-pub async fn get_session_stats(session_id: String) -> Result<SessionStats> {
+/// 鑾峰彇浼氳瘽缁熻蹇収銆?///
+/// 琛屼负璇存槑锛?/// - 宸茶繍琛屼細璇濊繑鍥炴渶杩戜竴娆?worker 鍒锋柊鐨勭粺璁″€硷紱
+/// - 鏈繍琛屼細璇濊繑鍥為粯璁ょ粺璁″璞★紝鑰屼笉鏄敊璇€?pub async fn get_session_stats(session_id: String) -> Result<SessionStats> {
     let sessions = lock_sessions()?;
     let Some(session) = sessions.get(&session_id) else {
         return Err(invalid_session_error(&session_id));
@@ -1008,22 +895,5 @@ pub async fn get_session_stats(session_id: String) -> Result<SessionStats> {
         Ok(default_stats())
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

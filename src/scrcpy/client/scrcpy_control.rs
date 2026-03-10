@@ -23,15 +23,19 @@ pub enum ControlMessageType {
     // ExpandNotificationPanel = 5,
     // CollapseNotificationPanel = 6,
     // GetClipboard = 7,
-    SetClipboard = 8,
+    // 注意：scrcpy server 协议中 SetClipboard 是 9，不是 8。
+    SetClipboard = 9,
     SetDisplayPower = 10,
+    /// 切换设备方向（仅切换，不是“绝对设为横/竖屏”）。
+    RotateDevice = 11,
+    /// 请求重置视频流（促发新的关键帧/参数集）。
+    ResetVideo = 17,
     // SetScreenPowerModeExpanded = 9,
-    // RotateDevice = 10,
-    // UhidCreate = 11,
-    // UhidInput = 12,
-    // OpenHardKeyboardSettings = 13,
-    // UhidDestroy = 14,
-    // StartApp = 15,
+    UhidCreate = 12,
+    UhidInput = 13,
+    // OpenHardKeyboardSettings = 14,
+    UhidDestroy = 14,
+    // StartApp = 16,
 }
 
 // Android触摸事件动作
@@ -258,7 +262,7 @@ impl ControlChannel {
             }
             Err(e) => {
                 error!("❌ TCP flush failed: {}", e);
-                return Err(ScrcpyError::Network(format!("Failed to flush control stream: {}", e)));
+                return Err(ScrcpyError::Network(format!("刷新控制通道失败: {}", e)));
             }
         }
 
@@ -294,7 +298,7 @@ impl ControlChannel {
             .map_err(|e| ScrcpyError::Network(format!("Failed to send key event: {}", e)))?;
 
         self.stream.flush().await
-            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
     }
@@ -358,7 +362,7 @@ impl ControlChannel {
             .map_err(|e| ScrcpyError::Network(format!("Failed to send scroll event: {}", e)))?;
 
         self.stream.flush().await
-            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
     }
@@ -411,7 +415,7 @@ impl ControlChannel {
     /// scrcpy 3.x 文本消息格式：
     /// [type=1][length:4][text:variable]
     pub async fn send_text(&mut self, text: &str) -> Result<()> {
-        info!("📝 Sending text: {} chars", text.len());
+        // info!("📝 Sending text: {} chars", text.len());
 
         let text_bytes = text.as_bytes();
         let mut msg = Vec::with_capacity(5 + text_bytes.len());
@@ -431,21 +435,21 @@ impl ControlChannel {
             .map_err(|e| ScrcpyError::Network(format!("Failed to send text: {}", e)))?;
 
         self.stream.flush().await
-            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
     }
 
     /// 设置设备剪贴板内容
     /// scrcpy 3.x 剪贴板消息格式：
-    /// [type=8][sequence:8][paste:1][length:4][text:variable]
+    /// [type=9][sequence:8][paste:1][length:4][text:variable]
     pub async fn set_clipboard(&mut self, text: &str, paste: bool) -> Result<()> {
         info!("📋 Setting clipboard: {} chars, paste={}", text.len(), paste);
 
         let text_bytes = text.as_bytes();
         let mut msg = Vec::with_capacity(14 + text_bytes.len());
 
-        // 1. 消息类型 (1 byte) = SetClipboard (8)
+        // 1. 消息类型 (1 byte) = SetClipboard (9)
         msg.push(ControlMessageType::SetClipboard as u8);
 
         // 2. sequence (8 bytes, Big Endian) - 用于同步，这里使用0
@@ -466,7 +470,7 @@ impl ControlChannel {
             .map_err(|e| ScrcpyError::Network(format!("Failed to set clipboard: {}", e)))?;
 
         self.stream.flush().await
-            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
         Ok(())
     }
@@ -491,21 +495,151 @@ impl ControlChannel {
         self.stream
             .flush()
             .await
-            .map_err(|e| ScrcpyError::Network(format!("Failed to flush control stream: {}", e)))?;
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
 
+        Ok(())
+    }
+
+    /// 通过 scrcpy 协议发送“切换设备方向”请求。
+    ///
+    /// 协议格式：
+    /// - 仅 1 字节类型值 `TYPE_ROTATE_DEVICE(11)`，无额外负载。
+    ///
+    /// 注意：
+    /// - 该能力是“切换(toggle)”语义，不保证一次调用后必然达到指定方向；
+    /// - 若需要“绝对方向”，应由上层结合当前分辨率/旋转状态决定是否发送。
+    pub async fn send_rotate_device(&mut self) -> Result<()> {
+        let msg = [ControlMessageType::RotateDevice as u8];
+        self.stream
+            .write_all(&msg)
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("Failed to rotate device: {}", e)))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
         Ok(())
     }
 
     /// 请求服务端重置视频流（提示尽快输出新的关键帧）。
     ///
-    /// 兼容性说明：
-    /// - 部分 scrcpy 版本未公开该控制消息类型；
-    /// - 为避免影响连接稳定性，这里采用“安全 no-op”策略返回成功；
-    /// - 后续若统一了 server 侧协议，可在此替换为真实消息发送。
+    /// 协议格式：
+    /// - 仅 1 字节类型值 `TYPE_RESET_VIDEO(17)`，无额外负载。
     pub async fn send_reset_video(&mut self) -> Result<()> {
+        let msg = [ControlMessageType::ResetVideo as u8];
+        self.stream
+            .write_all(&msg)
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("Failed to request reset video: {}", e)))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
+        Ok(())
+    }
+
+    /// 创建 UHID 键盘设备。
+    ///
+    /// 协议格式：
+    /// [type=12][id:2][vendor_id:2][product_id:2][name_len:1][name][report_desc_len:2][report_desc]
+    pub async fn send_uhid_create_keyboard(
+        &mut self,
+        id: u16,
+        vendor_id: u16,
+        product_id: u16,
+        name: &str,
+        report_desc: &[u8],
+    ) -> Result<()> {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > u8::MAX as usize {
+            return Err(ScrcpyError::Other(format!("UHID 键盘名称过长: {}", name_bytes.len())));
+        }
+        if report_desc.len() > u16::MAX as usize {
+            return Err(ScrcpyError::Other(format!("UHID 报告描述符过长: {}", report_desc.len())));
+        }
+
+        let mut msg = Vec::with_capacity(10 + name_bytes.len() + report_desc.len());
+        msg.push(ControlMessageType::UhidCreate as u8);
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.extend_from_slice(&vendor_id.to_be_bytes());
+        msg.extend_from_slice(&product_id.to_be_bytes());
+        msg.push(name_bytes.len() as u8);
+        msg.extend_from_slice(name_bytes);
+        msg.extend_from_slice(&(report_desc.len() as u16).to_be_bytes());
+        msg.extend_from_slice(report_desc);
+
+        info!("[UHID] 创建键盘设备: id={}, vendor_id={}, product_id={}, name_len={}, report_desc_len={}", id, vendor_id, product_id, name_bytes.len(), report_desc.len());
+
+        self.stream
+            .write_all(&msg)
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("创建 UHID 键盘失败: {}", e)))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 发送 UHID 输入报告。
+    ///
+    /// 协议格式：
+    /// [type=13][id:2][data_len:2][data]
+    pub async fn send_uhid_input(&mut self, id: u16, data: &[u8]) -> Result<()> {
+        if data.len() > u16::MAX as usize {
+            return Err(ScrcpyError::Other(format!("UHID 输入报告过长: {}", data.len())));
+        }
+
+        let mut msg = Vec::with_capacity(5 + data.len());
+        msg.push(ControlMessageType::UhidInput as u8);
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        msg.extend_from_slice(data);
+
+        debug!("[UHID] 发送输入报告: id={}, data_len={}", id, data.len());
+
+        self.stream
+            .write_all(&msg)
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("发送 UHID 输入报告失败: {}", e)))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 销毁 UHID 设备。
+    ///
+    /// 协议格式：
+    /// [type=14][id:2]
+    pub async fn send_uhid_destroy(&mut self, id: u16) -> Result<()> {
+        let mut msg = Vec::with_capacity(3);
+        msg.push(ControlMessageType::UhidDestroy as u8);
+        msg.extend_from_slice(&id.to_be_bytes());
+
+        info!("[UHID] 销毁设备: id={}", id);
+
+        self.stream
+            .write_all(&msg)
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("销毁 UHID 设备失败: {}", e)))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| ScrcpyError::Network(format!("刷新控制通道失败: {}", e)))?;
+
         Ok(())
     }
 }
+
+
+
+
+
+
 
 
 

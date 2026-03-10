@@ -22,14 +22,6 @@ const EVENT_QUEUE_LIMIT: usize = 256;
 const PIPELINE_HOOK_QUEUE: usize = 8;
 // 硬解失败后的 IDR 恢复窗口（毫秒）。
 const HW_RECOVERY_WAIT_MS: u64 = 220;
-// 视频包读取时间片（毫秒）。
-//
-// 设计目的：
-// - 防止 read_packet() 长时间阻塞，导致 Stop 命令无法及时生效；
-// - 让断开连接可以在短时间内回到主循环，优先处理停止/清理逻辑。
-// 注意：
-// - 这是“轮询切片”而非网络超时，超时后不会判错，只是让出执行权。
-const VIDEO_READ_SLICE_MS: u64 = 50;
 
 #[derive(Debug, Clone)]
 /// 解码输出帧（带代际标签）。
@@ -321,22 +313,12 @@ impl ScrcpyDecodePipeline {
             return Ok(false);
         }
 
-        // 使用“短时间片读取”而不是无限等待：
-        // 1) 读取到包：继续正常解码；
-        // 2) 时间片到期：本轮不报错，返回主循环处理控制命令（特别是 Stop）；
-        // 3) 读取报错：按真实错误处理。
-        let packet_opt = match tokio::time::timeout(
-            Duration::from_millis(VIDEO_READ_SLICE_MS),
-            async {
-                let reader = session.video_stream_mut()?;
-                reader.read_packet().await
-            },
-        )
-        .await
-        {
-            Err(_) => None,
-            Ok(Ok(packet_opt)) => packet_opt,
-            Ok(Err(e)) => return Err(e),
+        // 直接异步等待下一包数据，不再使用固定时间片轮询。
+        // 停止响应由外层 worker 的 tokio::select! 抢占控制：
+        // 当控制命令（如 Stop）先到达时，本次 pump future 会被取消并让出执行权。
+        let packet_opt = {
+            let reader = session.video_stream_mut()?;
+            reader.read_packet().await?
         };
 
         let mut did_work = false;

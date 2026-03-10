@@ -620,7 +620,44 @@ impl ScrcpyCoreRuntime {
         self.collect_session_events(session_id);
         ret
     }
+    /// 通过会话控制通道切换设备方向。
+    ///
+    /// 参数语义：
+    /// - `expected_portrait=true`：期望切换到竖屏；
+    /// - `expected_portrait=false`：期望切换到横屏。
+    ///
+    /// 实现说明：
+    /// - scrcpy 协议只有“切换方向”命令，没有“绝对设置方向”命令；
+    /// - 这里根据最近一次分辨率快照判断是否需要发送 rotate；
+    /// - 若尚无分辨率快照，默认发送一次 rotate 以满足用户操作预期。
+    pub async fn set_orientation_mode(&mut self, session_id: &str, expected_portrait: bool) -> Result<()> {
+        let need_rotate = match self.perf_states.get(session_id) {
+            Some(state) => {
+                let (w, h) = state.last_size;
+                if w == 0 || h == 0 {
+                    true
+                } else {
+                    let current_portrait = h >= w;
+                    current_portrait != expected_portrait
+                }
+            }
+            None => true,
+        };
 
+        if !need_rotate {
+            return Ok(());
+        }
+
+        let ret = {
+            let session = self
+                .session_manager
+                .get_mut(session_id)
+                .ok_or_else(|| ScrcpyError::Other(format!("invalid session id: {}", session_id)))?;
+            session.rotate_device().await
+        };
+        self.collect_session_events(session_id);
+        ret
+    }
     /// 设置设备物理屏幕电源状态。
     ///
     /// 说明：
@@ -638,6 +675,4 @@ impl ScrcpyCoreRuntime {
         ret
     }
 }
-
-
 
