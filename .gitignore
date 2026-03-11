@@ -23,4 +23,3 @@ lib
 .claude/
 *.log
 Cargo.lock
-Cargo.lock
