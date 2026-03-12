@@ -42,6 +42,20 @@ pub enum LogLevel {
     Error,
 }
 
+/// Rust -> Dart 日志事件模型（FRB 流传输）。
+#[frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEvent {
+    /// 日志级别文本（trace/debug/info/warn/error）。
+    pub level: String,
+    /// 日志来源 target。
+    pub target: String,
+    /// 日志正文。
+    pub message: String,
+    /// UTC 毫秒时间戳。
+    pub ts_millis: i64,
+}
+
 /// 创建会话所需配置（与 Flutter 桥接模型对齐）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -232,8 +246,3 @@ pub struct ScrollEvent {
     pub hscroll: i32,
     pub vscroll: i32,
 }
-
-
-
-
-

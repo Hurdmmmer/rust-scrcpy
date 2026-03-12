@@ -1,4 +1,3 @@
-use crate::config::config::{DISABLE_CUVID, REQUESTED_HW_DECODER};
 use crate::gh_common::{Result, ScrcpyError};
 use tracing::{debug, info, warn};
 
@@ -65,19 +64,11 @@ impl FfmpegDecoder {
     /// - `ForceHw`：仅硬解；
     /// - `ForceSw`：仅软解。
     pub fn new_with_mode(mode: FfmpegDecoderMode) -> Result<Self> {
-        ffmpeg_next::init()
-            .map_err(|e| ScrcpyError::Decode(format!("FFmpeg init failed: {}", e)))?;
+        ffmpeg_next::init().map_err(|e| ScrcpyError::Decode(format!("FFmpeg init failed: {}", e)))?;
         info!("FFmpeg initialized");
         info!("Decoder mode: {:?}", mode);
-        let requested_hw_decoder = REQUESTED_HW_DECODER.map(|s| s.to_string());
-        if let Some(ref name) = requested_hw_decoder {
-            info!("Requested hw decoder: {}", name);
-        }
-
-        let disable_cuvid = DISABLE_CUVID;
-        if disable_cuvid {
-            warn!("DISABLE_CUVID enabled, skip h264_cuvid");
-        }
+        
+        let requested_hw_decoder: Option<String> = None;
 
         // 按优先级探测可用硬解。注意：这里只能说明“可被发现”，
         // 运行时仍可能因驱动/上下文问题失败。
@@ -93,9 +84,7 @@ impl FfmpegDecoder {
 
         if mode != FfmpegDecoderMode::ForceSw {
             if let Some(ref force_name) = requested_hw_decoder {
-                if disable_cuvid && force_name.eq_ignore_ascii_case("h264_cuvid") {
-                    warn!("DISABLE_CUVID enabled, requested h264_cuvid ignored");
-                } else if let Some(hw_codec) =
+                if let Some(hw_codec) =
                     ffmpeg_next::codec::decoder::find_by_name(force_name.as_str())
                 {
                     info!("Found requested hw decoder: {}", force_name);
@@ -108,9 +97,7 @@ impl FfmpegDecoder {
 
             if codec.is_none() {
                 for (hw_name, hw_desc) in &hw_decoders {
-                    if disable_cuvid && *hw_name == "h264_cuvid" {
-                        continue;
-                    }
+                    
                     if let Some(hw_codec) = ffmpeg_next::codec::decoder::find_by_name(hw_name) {
                         info!("Found hw decoder: {} ({})", hw_name, hw_desc);
                         codec = Some(hw_codec);

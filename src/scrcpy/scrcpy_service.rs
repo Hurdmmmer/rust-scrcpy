@@ -8,25 +8,30 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
-
-use once_cell::sync::Lazy;
-use tokio::process::Command;
-use tracing::{Event, Level, Subscriber, info, warn};
-use tracing::field::{Field, Visit};
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{Layer, layer::SubscriberExt, registry::LookupSpan};
-use tracing_subscriber::filter::LevelFilter;
-
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::flutter_callback_register;
+use crate::frb_generated::StreamSink;
+use once_cell::sync::Lazy;
+use tokio::process::Command;
+use tracing::field::{Field, Visit};
+use tracing::{info, warn, Event, Level, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
+
 use crate::gh_common::model::{
-    DecoderMode, DeviceInfo, KeyEvent, LogLevel, OrientationChangeSource, OrientationMode,
-    RenderPipelineMode, ScrollEvent, SessionConfig, SessionConfigV2, SessionEvent, SessionStats,
-    SystemKey, TouchEvent,
+    DecoderMode, DeviceInfo, KeyEvent, LogEvent, LogLevel, OrientationChangeSource,
+    OrientationMode, RenderPipelineMode, ScrollEvent, SessionConfig, SessionConfigV2, SessionEvent,
+    SessionStats, SystemKey, TouchEvent,
 };
 use crate::gh_common::{Result, ScrcpyError};
 use crate::scrcpy::client::scrcpy_control::{
@@ -60,51 +65,76 @@ static API_SESSIONS: Lazy<Mutex<HashMap<String, ApiSession>>> =
 /// tracing subscriber 在同一进程里只能初始化一次，
 /// 这里用布尔位保证 `setup_logger` 幂等。
 static LOGGER_READY: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+/// 全局日志广播通道（Rust -> Dart FRB 订阅）。
+static LOG_EVENT_BUS: Lazy<broadcast::Sender<LogEvent>> = Lazy::new(|| {
+    let (tx, _rx) = broadcast::channel(2048);
+    tx
+});
 
-/// tracing 字段访问器：将事件字段拼接成文本，便于回传到 Flutter 日志面板。
-struct FlutterLogVisitor {
+/// tracing 字段访问器：提取 `message` 与其余字段。
+struct LogEventVisitor {
+    message: Option<String>,
     fields: Vec<String>,
 }
 
-impl FlutterLogVisitor {
-    /// 输出字段文本（`key=value`，逗号分隔）。
-    fn as_text(&self) -> String {
-        self.fields.join(", ")
+impl LogEventVisitor {
+    fn build_message(self) -> String {
+        match (self.message, self.fields.is_empty()) {
+            (Some(msg), true) => msg,
+            (Some(msg), false) => format!("{} {}", msg, self.fields.join(", ")),
+            (None, false) => self.fields.join(", "),
+            (None, true) => String::new(),
+        }
     }
 }
 
-impl Visit for FlutterLogVisitor {
+impl Visit for LogEventVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}").trim_matches('"').to_string());
+            return;
+        }
         self.fields.push(format!("{}={:?}", field.name(), value));
     }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+            return;
+        }
+        self.fields.push(format!("{}={}", field.name(), value));
+    }
 }
 
-/// tracing -> Flutter 日志桥接层。
-///
-/// 作用：
-/// - 监听每条 tracing event；
-/// - 抽取 level/target/fields；
-/// - 通过 `flutter_callback_register::notify_rust_log` 推送到 Runner。
-struct FlutterLogLayer;
+/// tracing 事件转发层：把 Rust 日志广播到 FRB 日志流。
+struct LogBroadcastLayer;
 
-impl<S> Layer<S> for FlutterLogLayer
+impl<S> Layer<S> for LogBroadcastLayer
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let meta = event.metadata();
-        let mut visitor = FlutterLogVisitor { fields: Vec::new() };
-        event.record(&mut visitor);
-        let fields_text = visitor.as_text();
-        let message = if fields_text.is_empty() {
-            format!("target={}", meta.target())
-        } else {
-            format!("target={} {}", meta.target(), fields_text)
+        let mut visitor = LogEventVisitor {
+            message: None,
+            fields: Vec::new(),
         };
-        crate::flutter_callback_register::notify_rust_log(
-            &meta.level().to_string(),
-            &message,
-        );
+        event.record(&mut visitor);
+        let message = visitor.build_message();
+        let meta = event.metadata();
+        let ts_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let _ = LOG_EVENT_BUS.send(LogEvent {
+            level: meta.level().to_string().to_lowercase(),
+            target: meta.target().to_string(),
+            message: if message.is_empty() {
+                format!("target={}", meta.target())
+            } else {
+                message
+            },
+            ts_millis,
+        });
     }
 }
 
@@ -137,6 +167,10 @@ struct RuntimeWorker {
     tx: Sender<RuntimeCommand>,
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<SessionStats>>,
+    /// 会话事件广播发送端（供 FRB 订阅链路读取）。
+    event_sender: broadcast::Sender<SessionEvent>,
+    /// 剪贴板事件广播发送端（供 FRB 独立剪贴板订阅读取）。
+    clipboard_sender: broadcast::Sender<String>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -238,7 +272,9 @@ fn map_decode_config(
     cfg.decoder_mode = decoder_mode;
     cfg.output_mode = match render_pipeline_mode {
         RenderPipelineMode::Original => crate::scrcpy::decode_core::DecoderOutputMode::GpuShared,
-        RenderPipelineMode::CpuPixelBufferV2 => crate::scrcpy::decode_core::DecoderOutputMode::CpuBgra,
+        RenderPipelineMode::CpuPixelBufferV2 => {
+            crate::scrcpy::decode_core::DecoderOutputMode::CpuBgra
+        }
     };
     cfg
 }
@@ -318,17 +354,6 @@ fn system_key_to_keycode(key: SystemKey) -> Option<u32> {
     }
 }
 
-/// 把会话事件序列化为 JSON，并投递到 Flutter 回调注册器。
-///
-/// 失败策略：
-/// - 序列化失败时静默忽略（不 panic、不阻断主流程）；
-/// - 原因是事件通知属于旁路能力，不应拖垮主会话链路。
-fn notify_session_event_json(session_id: &str, event: &SessionEvent) {
-    if let Ok(payload) = serde_json::to_vec(event) {
-        flutter_callback_register::notify_session_event(session_id, &payload);
-    }
-}
-
 /// 直接执行 adb 命令并返回 stdout 文本。
 ///
 /// 行为约束：
@@ -380,7 +405,12 @@ async fn adb_set_orientation_mode(
             {
                 let _ = adb_execute(
                     adb_path,
-                    &["-s", device_id, "shell", "settings put system accelerometer_rotation 1"],
+                    &[
+                        "-s",
+                        device_id,
+                        "shell",
+                        "settings put system accelerometer_rotation 1",
+                    ],
                 )
                 .await?;
             }
@@ -392,12 +422,22 @@ async fn adb_set_orientation_mode(
             {
                 let _ = adb_execute(
                     adb_path,
-                    &["-s", device_id, "shell", "settings put system accelerometer_rotation 0"],
+                    &[
+                        "-s",
+                        device_id,
+                        "shell",
+                        "settings put system accelerometer_rotation 0",
+                    ],
                 )
                 .await?;
                 let _ = adb_execute(
                     adb_path,
-                    &["-s", device_id, "shell", "settings put system user_rotation 0"],
+                    &[
+                        "-s",
+                        device_id,
+                        "shell",
+                        "settings put system user_rotation 0",
+                    ],
                 )
                 .await?;
             }
@@ -409,12 +449,22 @@ async fn adb_set_orientation_mode(
             {
                 let _ = adb_execute(
                     adb_path,
-                    &["-s", device_id, "shell", "settings put system accelerometer_rotation 0"],
+                    &[
+                        "-s",
+                        device_id,
+                        "shell",
+                        "settings put system accelerometer_rotation 0",
+                    ],
                 )
                 .await?;
                 let _ = adb_execute(
                     adb_path,
-                    &["-s", device_id, "shell", "settings put system user_rotation 1"],
+                    &[
+                        "-s",
+                        device_id,
+                        "shell",
+                        "settings put system user_rotation 1",
+                    ],
                 )
                 .await?;
             }
@@ -478,18 +528,18 @@ async fn handle_runtime_command(
         RuntimeCommand::SetOrientation(mode) => {
             match adb_set_orientation_mode(&config.adb_path, &config.device_id, mode).await {
                 Ok(_) => {
-                    notify_session_event_json(
+                    runtime.emit_session_event(
                         session_id,
-                        &SessionEvent::OrientationChanged {
+                        SessionEvent::OrientationChanged {
                             mode,
                             source: OrientationChangeSource::ManualApi,
                         },
                     );
                 }
                 Err(e) => {
-                    notify_session_event_json(
+                    runtime.emit_session_event(
                         session_id,
-                        &SessionEvent::Error {
+                        SessionEvent::Error {
                             code: crate::gh_common::model::ErrorCode::ControlFailed,
                             message: format!("set orientation failed: {}", e),
                         },
@@ -520,6 +570,11 @@ fn spawn_runtime_worker(
     // 使用有界异步通道，构建 Selector 风格事件循环。
     // 目的：命令与视频解码竞争执行权，Stop 命令可快速抢占。
     let (tx, mut rx): (Sender<RuntimeCommand>, Receiver<RuntimeCommand>) = mpsc::channel(256);
+    // 会话事件广播通道：Rust worker -> FRB 订阅者。
+    let (event_tx, _event_rx) = broadcast::channel::<SessionEvent>(512);
+    let (clipboard_tx, _clipboard_rx) = broadcast::channel::<String>(128);
+    let event_tx_c = event_tx.clone();
+    let clipboard_tx_c = clipboard_tx.clone();
     let running = Arc::new(AtomicBool::new(true));
     let stats = Arc::new(Mutex::new(default_stats()));
 
@@ -530,17 +585,17 @@ fn spawn_runtime_worker(
 
     // 每个会话独占一个 worker 线程，避免跨会话状态串扰。
     let join = std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(v) => v,
             Err(e) => {
                 warn!("[新服务] 创建 tokio runtime 失败: {}", e);
-                notify_session_event_json(
-                    &session_id_c,
-                    &SessionEvent::Error {
-                        code: crate::gh_common::model::ErrorCode::Internal,
-                        message: format!("runtime init failed: {}", e),
-                    },
-                );
+                let _ = event_tx_c.send(SessionEvent::Error {
+                    code: crate::gh_common::model::ErrorCode::Internal,
+                    message: format!("runtime init failed: {}", e),
+                });
                 running_c.store(false, Ordering::Relaxed);
                 return;
             }
@@ -567,20 +622,27 @@ fn spawn_runtime_worker(
             }
 
             if let Err(e) = runtime.start(session_id_c.clone()).await {
-                warn!("[新服务] 启动会话失败: session_id={}, err={}", session_id_c, e);
+                warn!(
+                    "[新服务] 启动会话失败: session_id={}, err={}",
+                    session_id_c, e
+                );
+                let _ = event_tx_c.send(SessionEvent::Error {
+                    code: crate::gh_common::model::ErrorCode::Internal,
+                    message: format!("start session failed: {}", e),
+                });
                 running_c.store(false, Ordering::Relaxed);
                 return;
             }
 
             // 会话启动后按配置执行一次熄屏策略。
-            if config.turn_screen_off {
-                if let Err(e) = runtime.set_display_power(&session_id_c, false).await {
-                    warn!(
-                        "[新服务] 会话启动后熄屏失败（不中断会话）: session_id={}, err={}",
-                        session_id_c, e
-                    );
-                }
-            }
+            // if config.turn_screen_off {
+            //     if let Err(e) = runtime.set_display_power(&session_id_c, false).await {
+            //         warn!(
+            //             "[新服务] 会话启动后熄屏失败（不中断会话）: session_id={}, err={}",
+            //             session_id_c, e
+            //         );
+            //     }
+            // }
 
             // Selector 风格主循环：
             // - `rx.recv()` 代表控制面事件；
@@ -622,13 +684,28 @@ fn spawn_runtime_worker(
                     }
                 }
 
+                if let Ok(events) = runtime.drain_session_events(&session_id_c) {
+                    for event in events {
+                        let _ = event_tx_c.send(event);
+                    }
+                }
+                if let Ok(clipboards) = runtime.drain_clipboard_updates(&session_id_c) {
+                    for text in clipboards {
+                        flutter_callback_register::notify_clipboard_text(&text);
+                        let _ = clipboard_tx_c.send(text);
+                    }
+                }
+
                 if !running_c.load(Ordering::Relaxed) {
                     break;
                 }
 
                 // 自动重连闭环：stop -> 短等待 -> start。
                 if let Ok(true) = runtime.decode_reconnect_required(&session_id_c) {
-                    warn!("[新服务] 检测到重连信号，执行自动重连: session_id={}", session_id_c);
+                    warn!(
+                        "[新服务] 检测到重连信号，执行自动重连: session_id={}",
+                        session_id_c
+                    );
                     let _ = runtime.stop(&session_id_c).await;
                     tokio::time::sleep(Duration::from_millis(120)).await;
                     if let Err(e) = runtime.start(session_id_c.clone()).await {
@@ -651,6 +728,17 @@ fn spawn_runtime_worker(
 
             // Worker 线程收到退出信号后，会在退出前兜底停止 runtime，确保连接与资源被释放。
             let _ = runtime.stop(&session_id_c).await;
+            if let Ok(events) = runtime.drain_session_events(&session_id_c) {
+                for event in events {
+                    let _ = event_tx_c.send(event);
+                }
+            }
+            if let Ok(clipboards) = runtime.drain_clipboard_updates(&session_id_c) {
+                for text in clipboards {
+                    flutter_callback_register::notify_clipboard_text(&text);
+                    let _ = clipboard_tx_c.send(text);
+                }
+            }
             running_c.store(false, Ordering::Relaxed);
         });
     });
@@ -659,6 +747,8 @@ fn spawn_runtime_worker(
         tx,
         running,
         stats,
+        event_sender: event_tx,
+        clipboard_sender: clipboard_tx,
         join: Some(join),
     }
 }
@@ -677,12 +767,11 @@ pub async fn setup_logger(max_level: LogLevel) -> Result<()> {
     }
 
     let level = map_level(max_level);
-    // 仅安装 FlutterLogLayer：
-    // - 统一把 Rust 日志回传到 Flutter 日志面板；
-    // - 避免 stdout 与 Flutter 面板双份输出造成刷屏和诊断噪音。
+    // 同时输出到标准输出 + FRB 日志广播通道。
     tracing_subscriber::registry()
         .with(LevelFilter::from_level(level))
-        .with(FlutterLogLayer)
+        .with(fmt::layer().with_target(true))
+        .with(LogBroadcastLayer)
         .try_init()
         .map_err(|e| ScrcpyError::Other(format!("setup logger failed: {}", e)))?;
 
@@ -729,15 +818,23 @@ pub async fn list_devices(adb_path: String) -> Result<Vec<DeviceInfo>> {
 ///
 /// 任一字段查询失败时降级为默认值，而不是整接口失败。
 pub async fn get_device_info(adb_path: String, device_id: String) -> Result<DeviceInfo> {
-    let model = adb_execute(&adb_path, &["-s", &device_id, "shell", "getprop ro.product.model"])
-        .await
-        .unwrap_or_else(|_| "Unknown".to_string())
-        .trim()
-        .to_string();
+    let model = adb_execute(
+        &adb_path,
+        &["-s", &device_id, "shell", "getprop ro.product.model"],
+    )
+    .await
+    .unwrap_or_else(|_| "Unknown".to_string())
+    .trim()
+    .to_string();
 
     let android_version = adb_execute(
         &adb_path,
-        &["-s", &device_id, "shell", "getprop ro.build.version.release"],
+        &[
+            "-s",
+            &device_id,
+            "shell",
+            "getprop ro.build.version.release",
+        ],
     )
     .await
     .unwrap_or_else(|_| "Unknown".to_string())
@@ -912,9 +1009,11 @@ pub async fn send_touch(session_id: String, event: TouchEvent) -> Result<()> {
         worker
             .tx
             .try_send(RuntimeCommand::Touch(event))
-             .map_err(|e| ScrcpyError::Other(format!("send touch command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send touch command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -928,9 +1027,11 @@ pub async fn send_key(session_id: String, event: KeyEvent) -> Result<()> {
         worker
             .tx
             .try_send(RuntimeCommand::Key(event))
-             .map_err(|e| ScrcpyError::Other(format!("send key command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send key command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -944,9 +1045,11 @@ pub async fn send_scroll(session_id: String, event: ScrollEvent) -> Result<()> {
         worker
             .tx
             .try_send(RuntimeCommand::Scroll(event))
-             .map_err(|e| ScrcpyError::Other(format!("send scroll command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send scroll command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -960,9 +1063,11 @@ pub async fn send_text(session_id: String, text: String) -> Result<()> {
         worker
             .tx
             .try_send(RuntimeCommand::Text(text))
-             .map_err(|e| ScrcpyError::Other(format!("send text command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send text command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -976,9 +1081,11 @@ pub async fn send_system_key(session_id: String, key: SystemKey) -> Result<()> {
         worker
             .tx
             .try_send(RuntimeCommand::SystemKey(key))
-             .map_err(|e| ScrcpyError::Other(format!("send system key command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send system key command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -994,9 +1101,11 @@ pub async fn set_clipboard(session_id: String, text: String, paste: bool) -> Res
         worker
             .tx
             .try_send(RuntimeCommand::Clipboard { text, paste })
-             .map_err(|e| ScrcpyError::Other(format!("send clipboard command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send clipboard command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -1012,9 +1121,11 @@ pub async fn set_orientation_mode(session_id: String, mode: OrientationMode) -> 
         worker
             .tx
             .try_send(RuntimeCommand::SetOrientation(mode))
-             .map_err(|e| ScrcpyError::Other(format!("send orientation command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send orientation command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -1030,9 +1141,11 @@ pub async fn request_idr(session_id: String) -> Result<()> {
         worker
             .tx
             .try_send(RuntimeCommand::RequestIdr)
-             .map_err(|e| ScrcpyError::Other(format!("send request idr command failed: {}", e)))
+            .map_err(|e| ScrcpyError::Other(format!("send request idr command failed: {}", e)))
     } else {
-        Err(ScrcpyError::Other("session runtime not started".to_string()))
+        Err(ScrcpyError::Other(
+            "session runtime not started".to_string(),
+        ))
     }
 }
 
@@ -1057,21 +1170,150 @@ pub async fn get_session_stats(session_id: String) -> Result<SessionStats> {
     }
 }
 
+/// 订阅会话事件流（Rust -> Dart，FRB StreamSink）。
+///
+/// 语义说明：
+/// - 仅允许订阅已启动会话；
+/// - 每个订阅者独立消费广播副本，互不影响；
+/// - 若 Dart 侧取消订阅，`sink.add` 将返回错误并退出转发线程。
+pub async fn subscribe_session_events(
+    session_id: String,
+    sink: StreamSink<SessionEvent>,
+) -> Result<()> {
+    let mut rx = {
+        let sessions = lock_sessions()?;
+        let Some(session) = sessions.get(&session_id) else {
+            return Err(invalid_session_error(&session_id));
+        };
+        let Some(worker) = &session.worker else {
+            return Err(ScrcpyError::Other(
+                "session runtime not started".to_string(),
+            ));
+        };
+        worker.event_sender.subscribe()
+    };
 
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
+        rt.block_on(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if sink.add(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
+    });
 
+    Ok(())
+}
 
+/// 订阅设备剪贴板事件流（仅 ClipboardChanged 文本）。
+///
+/// 语义说明：
+/// - 仅允许订阅已启动会话；
+/// - 每个订阅者独立消费广播副本，互不影响；
+/// - 若 Dart 侧取消订阅，`sink.add` 将返回错误并退出转发线程。
+pub async fn subscribe_clipboard_events(
+    session_id: String,
+    sink: StreamSink<String>,
+) -> Result<()> {
+    let mut rx = {
+        let sessions = lock_sessions()?;
+        let Some(session) = sessions.get(&session_id) else {
+            return Err(invalid_session_error(&session_id));
+        };
+        let Some(worker) = &session.worker else {
+            return Err(ScrcpyError::Other(
+                "session runtime not started".to_string(),
+            ));
+        };
+        worker.clipboard_sender.subscribe()
+    };
 
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
+        rt.block_on(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(text) => {
+                        if sink.add(text).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
+    });
 
+    Ok(())
+}
 
+/// 订阅 Rust 全局日志流（Rust -> Dart，FRB StreamSink）。
+///
+/// 语义说明：
+/// - 与会话无关，应用级全局订阅；
+/// - 若 Dart 侧取消订阅，Rust 转发线程自动退出；
+/// - 若接收端短时处理不过来，采用 broadcast lag 策略丢弃旧日志。
+pub async fn subscribe_logs(sink: StreamSink<LogEvent>) -> Result<()> {
+    let mut rx = LOG_EVENT_BUS.subscribe();
 
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
+        rt.block_on(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if sink.add(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
+    });
 
-
-
-
-
-
-
-
+    Ok(())
+}

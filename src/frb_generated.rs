@@ -37,7 +37,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
                     default_rust_auto_opaque = RustAutoOpaqueMoi,
                 );
                 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-                pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 2129575494;
+                pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -2103028118;
             
 
 // Section: executor
@@ -91,15 +91,6 @@ let api_device_id = <String>::sse_decode(&mut deserializer);deserializer.end(); 
                     transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>((move || async move {
                          let output_ok = crate::gh_api::flutter_api::get_session_stats(api_session_id).await?;   Ok(output_ok)
                     })().await)
-                } })
-            }fn wire__crate__gh_api__flutter_api__keep_session_event_type_for_flutter_impl(port_: flutter_rust_bridge::for_generated::MessagePort,ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,rust_vec_len_: i32,data_len_: i32)  {
-                FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec,_,_>(flutter_rust_bridge::for_generated::TaskInfo{ debug_name: "keep_session_event_type_for_flutter", port: Some(port_), mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal }, move || { 
-            let message = unsafe { flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(ptr_, rust_vec_len_, data_len_) };
-            let mut deserializer = flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_event = <crate::gh_common::model::SessionEvent>::sse_decode(&mut deserializer);deserializer.end(); move |context|  {
-                    transform_result_sse::<_, ()>((move ||  {
-                         let output_ok = Result::<_,()>::Ok(crate::gh_api::flutter_api::keep_session_event_type_for_flutter(api_event))?;   Ok(output_ok)
-                    })())
                 } })
             }fn wire__crate__gh_api__flutter_api__list_devices_impl(port_: flutter_rust_bridge::for_generated::MessagePort,ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,rust_vec_len_: i32,data_len_: i32)  {
                 FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec,_,_,_>(flutter_rust_bridge::for_generated::TaskInfo{ debug_name: "list_devices", port: Some(port_), mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal }, move || { 
@@ -217,6 +208,35 @@ let api_mode = <crate::gh_common::model::OrientationMode>::sse_decode(&mut deser
                          let output_ok = crate::gh_api::flutter_api::stop_session(api_session_id).await?;   Ok(output_ok)
                     })().await)
                 } })
+            }fn wire__crate__gh_api__flutter_api__subscribe_clipboard_events_impl(port_: flutter_rust_bridge::for_generated::MessagePort,ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,rust_vec_len_: i32,data_len_: i32)  {
+                FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec,_,_,_>(flutter_rust_bridge::for_generated::TaskInfo{ debug_name: "subscribe_clipboard_events", port: Some(port_), mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal }, move || { 
+            let message = unsafe { flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(ptr_, rust_vec_len_, data_len_) };
+            let mut deserializer = flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_session_id = <String>::sse_decode(&mut deserializer);
+let api_sink = <StreamSink<String,flutter_rust_bridge::for_generated::SseCodec>>::sse_decode(&mut deserializer);deserializer.end(); move |context| async move {
+                    transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>((move || async move {
+                         let output_ok = crate::gh_api::flutter_api::subscribe_clipboard_events(api_session_id, api_sink).await?;   Ok(output_ok)
+                    })().await)
+                } })
+            }fn wire__crate__gh_api__flutter_api__subscribe_logs_impl(port_: flutter_rust_bridge::for_generated::MessagePort,ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,rust_vec_len_: i32,data_len_: i32)  {
+                FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec,_,_,_>(flutter_rust_bridge::for_generated::TaskInfo{ debug_name: "subscribe_logs", port: Some(port_), mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal }, move || { 
+            let message = unsafe { flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(ptr_, rust_vec_len_, data_len_) };
+            let mut deserializer = flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_sink = <StreamSink<crate::gh_common::model::LogEvent,flutter_rust_bridge::for_generated::SseCodec>>::sse_decode(&mut deserializer);deserializer.end(); move |context| async move {
+                    transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>((move || async move {
+                         let output_ok = crate::gh_api::flutter_api::subscribe_logs(api_sink).await?;   Ok(output_ok)
+                    })().await)
+                } })
+            }fn wire__crate__gh_api__flutter_api__subscribe_session_events_impl(port_: flutter_rust_bridge::for_generated::MessagePort,ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,rust_vec_len_: i32,data_len_: i32)  {
+                FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec,_,_,_>(flutter_rust_bridge::for_generated::TaskInfo{ debug_name: "subscribe_session_events", port: Some(port_), mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal }, move || { 
+            let message = unsafe { flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(ptr_, rust_vec_len_, data_len_) };
+            let mut deserializer = flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_session_id = <String>::sse_decode(&mut deserializer);
+let api_sink = <StreamSink<crate::gh_common::model::SessionEvent,flutter_rust_bridge::for_generated::SseCodec>>::sse_decode(&mut deserializer);deserializer.end(); move |context| async move {
+                    transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>((move || async move {
+                         let output_ok = crate::gh_api::flutter_api::subscribe_session_events(api_session_id, api_sink).await?;   Ok(output_ok)
+                    })().await)
+                } })
             }
 
 // Section: dart2rust
@@ -226,6 +246,24 @@ let api_mode = <crate::gh_common::model::OrientationMode>::sse_decode(&mut deser
                     // Codec=Sse (Serialization based), see doc to use other codecs
                     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {let mut inner = <String>::sse_decode(deserializer);
         return flutter_rust_bridge::for_generated::anyhow::anyhow!("{}", inner);}
+                }
+                
+                impl SseDecode for StreamSink<String,flutter_rust_bridge::for_generated::SseCodec> {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {let mut inner = <String>::sse_decode(deserializer);
+        return StreamSink::deserialize(inner);}
+                }
+                
+                impl SseDecode for StreamSink<crate::gh_common::model::LogEvent,flutter_rust_bridge::for_generated::SseCodec> {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {let mut inner = <String>::sse_decode(deserializer);
+        return StreamSink::deserialize(inner);}
+                }
+                
+                impl SseDecode for StreamSink<crate::gh_common::model::SessionEvent,flutter_rust_bridge::for_generated::SseCodec> {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {let mut inner = <String>::sse_decode(deserializer);
+        return StreamSink::deserialize(inner);}
                 }
                 
                 impl SseDecode for String {
@@ -347,6 +385,15 @@ return crate::gh_common::model::KeyEvent{action: var_action, keycode: var_keycod
         let mut ans_ = vec![];
         for idx_ in 0..len_ { ans_.push(<u8>::sse_decode(deserializer)); }
         return ans_;}
+                }
+                
+                impl SseDecode for crate::gh_common::model::LogEvent {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {let mut var_level = <String>::sse_decode(deserializer);
+let mut var_target = <String>::sse_decode(deserializer);
+let mut var_message = <String>::sse_decode(deserializer);
+let mut var_tsMillis = <i64>::sse_decode(deserializer);
+return crate::gh_common::model::LogEvent{level: var_level, target: var_target, message: var_message, ts_millis: var_tsMillis};}
                 }
                 
                 impl SseDecode for crate::gh_common::model::LogLevel {
@@ -536,19 +583,21 @@ return crate::gh_common::model::TouchEvent{action: var_action, pointer_id: var_p
 3 => wire__crate__gh_api__flutter_api__dispose_session_impl(port, ptr, rust_vec_len, data_len),
 4 => wire__crate__gh_api__flutter_api__get_device_info_impl(port, ptr, rust_vec_len, data_len),
 5 => wire__crate__gh_api__flutter_api__get_session_stats_impl(port, ptr, rust_vec_len, data_len),
-6 => wire__crate__gh_api__flutter_api__keep_session_event_type_for_flutter_impl(port, ptr, rust_vec_len, data_len),
-7 => wire__crate__gh_api__flutter_api__list_devices_impl(port, ptr, rust_vec_len, data_len),
-8 => wire__crate__gh_api__flutter_api__request_idr_impl(port, ptr, rust_vec_len, data_len),
-9 => wire__crate__gh_api__flutter_api__send_key_impl(port, ptr, rust_vec_len, data_len),
-10 => wire__crate__gh_api__flutter_api__send_scroll_impl(port, ptr, rust_vec_len, data_len),
-11 => wire__crate__gh_api__flutter_api__send_system_key_impl(port, ptr, rust_vec_len, data_len),
-12 => wire__crate__gh_api__flutter_api__send_text_impl(port, ptr, rust_vec_len, data_len),
-13 => wire__crate__gh_api__flutter_api__send_touch_impl(port, ptr, rust_vec_len, data_len),
-14 => wire__crate__gh_api__flutter_api__set_clipboard_impl(port, ptr, rust_vec_len, data_len),
-15 => wire__crate__gh_api__flutter_api__set_orientation_mode_impl(port, ptr, rust_vec_len, data_len),
-16 => wire__crate__gh_api__flutter_api__setup_logger_impl(port, ptr, rust_vec_len, data_len),
-17 => wire__crate__gh_api__flutter_api__start_session_impl(port, ptr, rust_vec_len, data_len),
-18 => wire__crate__gh_api__flutter_api__stop_session_impl(port, ptr, rust_vec_len, data_len),
+6 => wire__crate__gh_api__flutter_api__list_devices_impl(port, ptr, rust_vec_len, data_len),
+7 => wire__crate__gh_api__flutter_api__request_idr_impl(port, ptr, rust_vec_len, data_len),
+8 => wire__crate__gh_api__flutter_api__send_key_impl(port, ptr, rust_vec_len, data_len),
+9 => wire__crate__gh_api__flutter_api__send_scroll_impl(port, ptr, rust_vec_len, data_len),
+10 => wire__crate__gh_api__flutter_api__send_system_key_impl(port, ptr, rust_vec_len, data_len),
+11 => wire__crate__gh_api__flutter_api__send_text_impl(port, ptr, rust_vec_len, data_len),
+12 => wire__crate__gh_api__flutter_api__send_touch_impl(port, ptr, rust_vec_len, data_len),
+13 => wire__crate__gh_api__flutter_api__set_clipboard_impl(port, ptr, rust_vec_len, data_len),
+14 => wire__crate__gh_api__flutter_api__set_orientation_mode_impl(port, ptr, rust_vec_len, data_len),
+15 => wire__crate__gh_api__flutter_api__setup_logger_impl(port, ptr, rust_vec_len, data_len),
+16 => wire__crate__gh_api__flutter_api__start_session_impl(port, ptr, rust_vec_len, data_len),
+17 => wire__crate__gh_api__flutter_api__stop_session_impl(port, ptr, rust_vec_len, data_len),
+18 => wire__crate__gh_api__flutter_api__subscribe_clipboard_events_impl(port, ptr, rust_vec_len, data_len),
+19 => wire__crate__gh_api__flutter_api__subscribe_logs_impl(port, ptr, rust_vec_len, data_len),
+20 => wire__crate__gh_api__flutter_api__subscribe_session_events_impl(port, ptr, rust_vec_len, data_len),
                         _ => unreachable!(),
                     }
                 }
@@ -680,6 +729,23 @@ self.metastate.into_into_dart().into_dart()
             impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::gh_common::model::KeyEvent {}
 impl flutter_rust_bridge::IntoIntoDart<crate::gh_common::model::KeyEvent> for crate::gh_common::model::KeyEvent {
             fn into_into_dart(self) -> crate::gh_common::model::KeyEvent {
+                self
+            }
+        }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+            impl flutter_rust_bridge::IntoDart for crate::gh_common::model::LogEvent {
+                fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+                    [
+                    self.level.into_into_dart().into_dart(),
+self.target.into_into_dart().into_dart(),
+self.message.into_into_dart().into_dart(),
+self.ts_millis.into_into_dart().into_dart()
+                ].into_dart()
+                }
+            }
+            impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::gh_common::model::LogEvent {}
+impl flutter_rust_bridge::IntoIntoDart<crate::gh_common::model::LogEvent> for crate::gh_common::model::LogEvent {
+            fn into_into_dart(self) -> crate::gh_common::model::LogEvent {
                 self
             }
         }
@@ -905,6 +971,21 @@ impl flutter_rust_bridge::IntoIntoDart<crate::gh_common::model::TouchEvent> for 
                     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {<String>::sse_encode(format!("{:?}", self), serializer);}
                 }
                 
+                impl SseEncode for StreamSink<String,flutter_rust_bridge::for_generated::SseCodec> {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {unimplemented!("")}
+                }
+                
+                impl SseEncode for StreamSink<crate::gh_common::model::LogEvent,flutter_rust_bridge::for_generated::SseCodec> {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {unimplemented!("")}
+                }
+                
+                impl SseEncode for StreamSink<crate::gh_common::model::SessionEvent,flutter_rust_bridge::for_generated::SseCodec> {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {unimplemented!("")}
+                }
+                
                 impl SseEncode for String {
                     // Codec=Sse (Serialization based), see doc to use other codecs
                     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {<Vec<u8>>::sse_encode(self.into_bytes(), serializer);}
@@ -1005,6 +1086,14 @@ crate::gh_common::model::ErrorCode::Internal => { 7 }
                     // Codec=Sse (Serialization based), see doc to use other codecs
                     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {<i32>::sse_encode(self.len() as _, serializer);
         for item in self { <u8>::sse_encode(item, serializer); }}
+                }
+                
+                impl SseEncode for crate::gh_common::model::LogEvent {
+                    // Codec=Sse (Serialization based), see doc to use other codecs
+                    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {<String>::sse_encode(self.level, serializer);
+<String>::sse_encode(self.target, serializer);
+<String>::sse_encode(self.message, serializer);
+<i64>::sse_encode(self.ts_millis, serializer);}
                 }
                 
                 impl SseEncode for crate::gh_common::model::LogLevel {

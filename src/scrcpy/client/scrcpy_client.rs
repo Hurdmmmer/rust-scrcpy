@@ -68,6 +68,7 @@ impl ScrcpyClient {
     /// 连接后执行启动策略。
     ///
     /// 该阶段 `Session` 已就绪，可以走控制通道能力。
+    /// 暂时执行根据Flutter 传递过来的熄屏指令
     async fn apply_startup_policies_after_session(&self, session: &mut Session) -> Result<()> {
         if self.config.turn_screen_off {
             session.set_display_power(false).await?;

@@ -6,12 +6,14 @@
 //! - 回调注册由 `flutter_callback_register` 独立承载。
 
 pub use crate::gh_common::model::{
-    DecoderMode, DeviceInfo, LogLevel, OrientationChangeSource, OrientationMode, RenderPipelineMode,
-    SessionConfig, SessionConfigV2, SessionEvent, SessionStats, SystemKey, TextureFrame,
+    DecoderMode, DeviceInfo, LogEvent, LogLevel, OrientationChangeSource, OrientationMode,
+    RenderPipelineMode, SessionConfig, SessionConfigV2, SessionEvent, SessionStats, SystemKey,
+    TextureFrame,
 };
 
-use crate::gh_common::Result;
+use crate::frb_generated::StreamSink;
 use crate::gh_common::model::{KeyEvent, ScrollEvent, TouchEvent};
+use crate::gh_common::Result;
 use crate::scrcpy::scrcpy_service as session_service;
 
 /// 初始化 Rust 侧日志系统。
@@ -68,7 +70,6 @@ pub async fn dispose_session(session_id: String) -> Result<()> {
     session_service::dispose_session(session_id).await
 }
 
-
 /// 发送触摸事件到设备。
 pub async fn send_touch(session_id: String, event: TouchEvent) -> Result<()> {
     session_service::send_touch(session_id, event).await
@@ -118,17 +119,35 @@ pub async fn get_session_stats(session_id: String) -> Result<SessionStats> {
     session_service::get_session_stats(session_id).await
 }
 
-
-/// FRB 类型保留锚点：
+/// 订阅会话事件流（替代 Runner -> MethodChannel 事件桥）。
 ///
-/// 目的：
-/// - SessionEvent 由 Runner -> MethodChannel -> Dart 回传，不走 FRB 调用链；
-/// - 但 Dart 业务层仍复用 FRB 生成的 SessionEvent/ErrorCode/OrientationChangeSource 类型。
-///
-/// 该函数不参与业务流程，仅用于让 FRB 保留上述类型生成。
-pub fn keep_session_event_type_for_flutter(event: SessionEvent) -> SessionEvent {
-    event
+/// 说明：
+/// - 该接口返回后，Rust 将异步持续向 `sink` 推送 `SessionEvent`；
+/// - 调用方取消 Dart 订阅后，Rust 转发线程会自动退出。
+pub async fn subscribe_session_events(
+    session_id: String,
+    sink: StreamSink<SessionEvent>,
+) -> Result<()> {
+    session_service::subscribe_session_events(session_id, sink).await
 }
 
+/// 订阅设备剪贴板事件流（仅 `ClipboardChanged` 文本）。
+///
+/// 说明：
+/// - 与会话主事件流解耦，避免上层为处理剪贴板而阻塞状态链路；
+/// - 调用方取消 Dart 订阅后，Rust 转发线程会自动退出。
+pub async fn subscribe_clipboard_events(
+    session_id: String,
+    sink: StreamSink<String>,
+) -> Result<()> {
+    session_service::subscribe_clipboard_events(session_id, sink).await
+}
 
-
+/// 订阅 Rust 日志流（FRB）。
+///
+/// 说明：
+/// - 全局日志总线，不绑定单会话；
+/// - 调用方取消 Dart 订阅后，Rust 转发线程会自动退出。
+pub async fn subscribe_logs(sink: StreamSink<LogEvent>) -> Result<()> {
+    session_service::subscribe_logs(sink).await
+}

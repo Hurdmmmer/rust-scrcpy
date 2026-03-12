@@ -1,18 +1,16 @@
-use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
-use serde_json::json;
-
 use crate::flutter_callback_register;
-use crate::gh_common::{Result, ScrcpyError};
 use crate::gh_common::model::{ErrorCode, SessionEvent, SessionStats};
-use crate::scrcpy::decode_core::{DecodedFrame, PipelineStats};
+use crate::gh_common::{Result, ScrcpyError};
 use crate::scrcpy::client::scrcpy_conn::ScrcpyConnect;
 use crate::scrcpy::client::scrcpy_control::{KeyEvent, ScrollEvent, TouchEvent};
 use crate::scrcpy::client::ScrcpyClient;
+use crate::scrcpy::decode_core::{DecodedFrame, PipelineStats};
 use crate::scrcpy::runtime::scrcpy_decode_pipeline::{
     DecodeFrame, ScrcpyDecodeConfig, ScrcpyDecodeEvent, ScrcpyDecodePipeline,
 };
 use crate::scrcpy::session::SessionManager;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Runtime 侧会话事件队列上限。
@@ -116,26 +114,21 @@ impl ScrcpyCoreRuntime {
         out
     }
 
-    /// 写入 runtime 会话事件队列，并立即转发到 callback 注册层。
+    /// 写入 runtime 会话事件队列（由上层按需读取并分发）。
     fn push_runtime_event(&mut self, session_id: &str, event: SessionEvent) {
         let q = self
             .session_events
             .entry(session_id.to_string())
             .or_insert_with(|| VecDeque::with_capacity(RUNTIME_EVENT_QUEUE_LIMIT));
-        q.push_back(event.clone());
+        q.push_back(event);
         while q.len() > RUNTIME_EVENT_QUEUE_LIMIT {
             let _ = q.pop_front();
         }
+    }
 
-        match serde_json::to_vec(&event) {
-            Ok(payload) => {
-                // 注意：这里只调用既有 callback 转发函数，不修改 callback ABI。
-                flutter_callback_register::notify_session_event(session_id, &payload);
-            }
-            Err(e) => {
-                warn!("[核心运行时] SessionEvent 序列化失败: session_id={}, err={}", session_id, e);
-            }
-        }
+    /// 向会话事件队列主动写入一条业务事件。
+    pub fn emit_session_event(&mut self, session_id: &str, event: SessionEvent) {
+        self.push_runtime_event(session_id, event);
     }
 
     /// 写入 runtime 原始解码事件队列。
@@ -188,7 +181,10 @@ impl ScrcpyCoreRuntime {
             ScrcpyDecodeEvent::DecoderStarted { .. } => None,
             ScrcpyDecodeEvent::DecoderDegraded { from, to, reason } => Some(SessionEvent::Error {
                 code: ErrorCode::DecodeFailed,
-                message: format!("decoder degraded: {:?} -> {:?}, reason={}", from, to, reason),
+                message: format!(
+                    "decoder degraded: {:?} -> {:?}, reason={}",
+                    from, to, reason
+                ),
             }),
             ScrcpyDecodeEvent::ResolutionChanged {
                 generation,
@@ -314,27 +310,16 @@ impl ScrcpyCoreRuntime {
     /// - 先拉取 Session 本地事件；
     /// - 再拉取 Decode 事件并做模型映射。
     fn collect_session_events(&mut self, session_id: &str) {
-        let (session_events, clipboard_updates) = if let Some(session) = self.session_manager.get_mut(session_id) {
+        let session_events = if let Some(session) = self.session_manager.get_mut(session_id) {
             let _ = session.poll_control_messages();
-            (session.drain_events(), session.drain_clipboard_updates())
+            session.drain_events()
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
 
         for event in session_events {
             self.push_runtime_event(session_id, event);
         }
-        for text in clipboard_updates {
-            let payload = json!({
-                "ClipboardChanged": {
-                    "text": text,
-                }
-            });
-            if let Ok(bytes) = serde_json::to_vec(&payload) {
-                flutter_callback_register::notify_session_event(session_id, &bytes);
-            }
-        }
-
         if let Some(pipeline) = self.decode_pipelines.get_mut(session_id) {
             for event in pipeline.drain_events() {
                 self.push_decode_event(session_id, event.clone());
@@ -349,7 +334,10 @@ impl ScrcpyCoreRuntime {
     pub async fn start(&mut self, session_id: String) -> Result<()> {
         debug!("[核心运行时] 请求启动会话: session_id={}", session_id);
         if self.session_manager.get(&session_id).is_some() {
-            warn!("[核心运行时] 启动失败，会话已存在: session_id={}", session_id);
+            warn!(
+                "[核心运行时] 启动失败，会话已存在: session_id={}",
+                session_id
+            );
             return Err(ScrcpyError::Other(format!(
                 "session already exists: {}",
                 session_id
@@ -362,21 +350,33 @@ impl ScrcpyCoreRuntime {
 
     /// 使用给定连接参数启动会话。
     pub async fn start_with_conn(&mut self, session_id: String, conn: ScrcpyConnect) -> Result<()> {
-        debug!("[核心运行时] 使用外部连接对象启动会话: session_id={}", session_id);
+        debug!(
+            "[核心运行时] 使用外部连接对象启动会话: session_id={}",
+            session_id
+        );
         if self.session_manager.get(&session_id).is_some() {
-            warn!("[核心运行时] 启动失败，会话已存在: session_id={}", session_id);
+            warn!(
+                "[核心运行时] 启动失败，会话已存在: session_id={}",
+                session_id
+            );
             return Err(ScrcpyError::Other(format!(
                 "session already exists: {}",
                 session_id
             )));
         }
 
-        self.session_events
-            .insert(session_id.clone(), VecDeque::with_capacity(RUNTIME_EVENT_QUEUE_LIMIT));
-        self.decode_events
-            .insert(session_id.clone(), VecDeque::with_capacity(RUNTIME_DECODE_EVENT_QUEUE_LIMIT));
-        self.decoded_frames
-            .insert(session_id.clone(), VecDeque::with_capacity(RUNTIME_FRAME_QUEUE_LIMIT));
+        self.session_events.insert(
+            session_id.clone(),
+            VecDeque::with_capacity(RUNTIME_EVENT_QUEUE_LIMIT),
+        );
+        self.decode_events.insert(
+            session_id.clone(),
+            VecDeque::with_capacity(RUNTIME_DECODE_EVENT_QUEUE_LIMIT),
+        );
+        self.decoded_frames.insert(
+            session_id.clone(),
+            VecDeque::with_capacity(RUNTIME_FRAME_QUEUE_LIMIT),
+        );
         self.session_stats
             .insert(session_id.clone(), Self::default_stats());
         self.perf_states
@@ -433,15 +433,24 @@ impl ScrcpyCoreRuntime {
 
     /// 拉取并清空会话事件队列（供 Flutter API 轮询）。
     pub fn drain_session_events(&mut self, session_id: &str) -> Result<Vec<SessionEvent>> {
-        let q = self
-            .session_events
-            .get_mut(session_id)
-            .ok_or_else(|| ScrcpyError::Other(format!("session events not found: {}", session_id)))?;
+        let q = self.session_events.get_mut(session_id).ok_or_else(|| {
+            ScrcpyError::Other(format!("session events not found: {}", session_id))
+        })?;
         let mut out = Vec::with_capacity(q.len());
         while let Some(event) = q.pop_front() {
             out.push(event);
         }
         Ok(out)
+    }
+
+    /// 拉取并清空会话剪贴板更新（独立回调通道）。
+    pub fn drain_clipboard_updates(&mut self, session_id: &str) -> Result<Vec<String>> {
+        let session = self
+            .session_manager
+            .get_mut(session_id)
+            .ok_or_else(|| ScrcpyError::Other(format!("invalid session id: {}", session_id)))?;
+        session.poll_control_messages()?;
+        Ok(session.drain_clipboard_updates())
     }
 
     /// 执行一次解码泵送。
@@ -453,19 +462,17 @@ impl ScrcpyCoreRuntime {
                 .ok_or_else(|| ScrcpyError::Other(format!("invalid session id: {}", session_id)))?;
             // 每轮泵送前先消费控制通道设备消息，确保剪贴板/ACK 不积压。
             session.poll_control_messages()?;
-            let pipeline = self
-                .decode_pipelines
-                .get_mut(session_id)
-                .ok_or_else(|| ScrcpyError::Other(format!("decode pipeline not found: {}", session_id)))?;
+            let pipeline = self.decode_pipelines.get_mut(session_id).ok_or_else(|| {
+                ScrcpyError::Other(format!("decode pipeline not found: {}", session_id))
+            })?;
             pipeline.pump_once(session).await?
         };
 
         // 解码帧迁移到 runtime 队列，并转发回调。
         let fresh_frames = {
-            let pipeline = self
-                .decode_pipelines
-                .get_mut(session_id)
-                .ok_or_else(|| ScrcpyError::Other(format!("decode pipeline not found: {}", session_id)))?;
+            let pipeline = self.decode_pipelines.get_mut(session_id).ok_or_else(|| {
+                ScrcpyError::Other(format!("decode pipeline not found: {}", session_id))
+            })?;
             pipeline.drain_frames()
         };
         self.process_new_frames(session_id, fresh_frames);
@@ -474,7 +481,9 @@ impl ScrcpyCoreRuntime {
         let snap = self
             .decode_pipelines
             .get(session_id)
-            .ok_or_else(|| ScrcpyError::Other(format!("decode pipeline not found: {}", session_id)))?
+            .ok_or_else(|| {
+                ScrcpyError::Other(format!("decode pipeline not found: {}", session_id))
+            })?
             .stats();
         if let Some(s) = self.session_stats.get_mut(session_id) {
             s.decode_latency_ms = snap.last_decode_ms as u32;
@@ -500,10 +509,9 @@ impl ScrcpyCoreRuntime {
 
     /// 获取解码统计快照。
     pub fn decode_stats(&self, session_id: &str) -> Result<PipelineStats> {
-        let pipeline = self
-            .decode_pipelines
-            .get(session_id)
-            .ok_or_else(|| ScrcpyError::Other(format!("decode pipeline not found: {}", session_id)))?;
+        let pipeline = self.decode_pipelines.get(session_id).ok_or_else(|| {
+            ScrcpyError::Other(format!("decode pipeline not found: {}", session_id))
+        })?;
         Ok(pipeline.stats())
     }
 
@@ -511,10 +519,9 @@ impl ScrcpyCoreRuntime {
     ///
     /// 策略：每次仅返回“最后一帧”，避免上层消费积压导致延迟扩散。
     pub fn drain_decoded_frames(&mut self, session_id: &str) -> Result<Vec<DecodeFrame>> {
-        let q = self
-            .decoded_frames
-            .get_mut(session_id)
-            .ok_or_else(|| ScrcpyError::Other(format!("decoded frames not found: {}", session_id)))?;
+        let q = self.decoded_frames.get_mut(session_id).ok_or_else(|| {
+            ScrcpyError::Other(format!("decoded frames not found: {}", session_id))
+        })?;
         let mut latest: Option<DecodeFrame> = None;
         while let Some(frame) = q.pop_front() {
             latest = Some(frame);
@@ -524,10 +531,9 @@ impl ScrcpyCoreRuntime {
 
     /// 拉取并清空原始解码事件（调试用途）。
     pub fn drain_decode_events(&mut self, session_id: &str) -> Result<Vec<ScrcpyDecodeEvent>> {
-        let q = self
-            .decode_events
-            .get_mut(session_id)
-            .ok_or_else(|| ScrcpyError::Other(format!("decode events not found: {}", session_id)))?;
+        let q = self.decode_events.get_mut(session_id).ok_or_else(|| {
+            ScrcpyError::Other(format!("decode events not found: {}", session_id))
+        })?;
         let mut out = Vec::with_capacity(q.len());
         while let Some(event) = q.pop_front() {
             out.push(event);
@@ -545,10 +551,9 @@ impl ScrcpyCoreRuntime {
 
     /// 返回当前会话是否需要重连。
     pub fn decode_reconnect_required(&self, session_id: &str) -> Result<bool> {
-        let pipeline = self
-            .decode_pipelines
-            .get(session_id)
-            .ok_or_else(|| ScrcpyError::Other(format!("decode pipeline not found: {}", session_id)))?;
+        let pipeline = self.decode_pipelines.get(session_id).ok_or_else(|| {
+            ScrcpyError::Other(format!("decode pipeline not found: {}", session_id))
+        })?;
         Ok(pipeline.reconnect_required())
     }
 
@@ -648,7 +653,11 @@ impl ScrcpyCoreRuntime {
     /// - scrcpy 协议只有“切换方向”命令，没有“绝对设置方向”命令；
     /// - 这里根据最近一次分辨率快照判断是否需要发送 rotate；
     /// - 若尚无分辨率快照，默认发送一次 rotate 以满足用户操作预期。
-    pub async fn set_orientation_mode(&mut self, session_id: &str, expected_portrait: bool) -> Result<()> {
+    pub async fn set_orientation_mode(
+        &mut self,
+        session_id: &str,
+        expected_portrait: bool,
+    ) -> Result<()> {
         let need_rotate = match self.perf_states.get(session_id) {
             Some(state) => {
                 let (w, h) = state.last_size;

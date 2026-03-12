@@ -39,31 +39,8 @@ type V1FrameCallback = extern "C" fn(
     pts: i64,
 );
 
-/// SessionEvent 回调：推送会话事件 JSON。
-///
-/// 参数约定：
-/// - session_id/session_id_len: 会话 ID UTF-8 字节；
-/// - event_json/event_json_len: SessionEvent 的 JSON UTF-8 字节。
-type SessionEventCallback = extern "C" fn(
-    user_data: *mut c_void,
-    session_id: *const u8,
-    session_id_len: usize,
-    event_json: *const u8,
-    event_json_len: usize,
-);
-
-/// RustLog 回调：推送 Rust tracing 日志。
-///
-/// 参数约定：
-/// - level/level_len: 日志级别文本（UTF-8，如 INFO/WARN/ERROR）；
-/// - message/message_len: 日志正文（UTF-8）。
-type RustLogCallback = extern "C" fn(
-    user_data: *mut c_void,
-    level: *const u8,
-    level_len: usize,
-    message: *const u8,
-    message_len: usize,
-);
+/// 剪贴板回调：推送 UTF-8 文本字节（不带 '\0' 结尾）。
+type ClipboardCallback = extern "C" fn(user_data: *mut c_void, data: *const u8, data_len: usize);
 
 #[derive(Clone, Copy)]
 struct V2CallbackHolder {
@@ -94,28 +71,14 @@ static V1_CALLBACK: Lazy<Mutex<V1CallbackHolder>> = Lazy::new(|| {
 });
 
 #[derive(Clone, Copy)]
-struct SessionEventCallbackHolder {
-    callback: Option<SessionEventCallback>,
+struct ClipboardCallbackHolder {
+    callback: Option<ClipboardCallback>,
     /// 由调用方透传的上下文指针（C++ Runner 实例）。
     user_data: usize,
 }
 
-static SESSION_EVENT_CALLBACK: Lazy<Mutex<SessionEventCallbackHolder>> = Lazy::new(|| {
-    Mutex::new(SessionEventCallbackHolder {
-        callback: None,
-        user_data: 0,
-    })
-});
-
-#[derive(Clone, Copy)]
-struct RustLogCallbackHolder {
-    callback: Option<RustLogCallback>,
-    /// 由调用方透传的上下文指针（C++ Runner 实例）。
-    user_data: usize,
-}
-
-static RUST_LOG_CALLBACK: Lazy<Mutex<RustLogCallbackHolder>> = Lazy::new(|| {
-    Mutex::new(RustLogCallbackHolder {
+static CLIPBOARD_CALLBACK: Lazy<Mutex<ClipboardCallbackHolder>> = Lazy::new(|| {
+    Mutex::new(ClipboardCallbackHolder {
         callback: None,
         user_data: 0,
     })
@@ -157,31 +120,15 @@ pub extern "C" fn rs_register_v1_frame_callback(
     true
 }
 
-/// 注册 SessionEvent 回调（由 Windows Runner 调用一次）。
+/// 注册剪贴板文本回调（由 Windows Runner 调用一次）。
 ///
-/// 回调触发线程：Rust 运行时 worker 线程。
+/// 回调触发线程：Rust 会话 worker 线程。
 #[no_mangle]
-pub extern "C" fn rs_register_session_event_callback(
-    callback: Option<SessionEventCallback>,
+pub extern "C" fn rs_register_clipboard_callback(
+    callback: Option<ClipboardCallback>,
     user_data: *mut c_void,
 ) -> bool {
-    let Ok(mut guard) = SESSION_EVENT_CALLBACK.lock() else {
-        return false;
-    };
-    guard.callback = callback;
-    guard.user_data = user_data as usize;
-    true
-}
-
-/// 注册 RustLog 回调（由 Windows Runner 调用一次）。
-///
-/// 回调触发线程：Rust 运行时线程（tracing 产生日志时）。
-#[no_mangle]
-pub extern "C" fn rs_register_rust_log_callback(
-    callback: Option<RustLogCallback>,
-    user_data: *mut c_void,
-) -> bool {
-    let Ok(mut guard) = RUST_LOG_CALLBACK.lock() else {
+    let Ok(mut guard) = CLIPBOARD_CALLBACK.lock() else {
         return false;
     };
     guard.callback = callback;
@@ -225,13 +172,7 @@ pub fn notify_v2_frame_raw(
 }
 
 /// 向外部（Runner）推送一条 V1 句柄帧通知。
-pub fn notify_v1_frame(
-    handle: i64,
-    width: u32,
-    height: u32,
-    generation: u64,
-    pts: i64,
-) {
+pub fn notify_v1_frame(handle: i64, width: u32, height: u32, generation: u64, pts: i64) {
     // 回调指针先复制到栈，避免持锁期间执行外部代码。
     let (cb, user_data) = {
         let Ok(guard) = V1_CALLBACK.lock() else {
@@ -245,48 +186,17 @@ pub fn notify_v1_frame(
     }
 }
 
-/// 向外部（Runner）推送一条会话事件通知。
-///
-/// `event_json` 要求为 UTF-8 JSON 字节（通常由 `serde_json::to_vec` 生成）。
-pub fn notify_session_event(session_id: &str, event_json: &[u8]) {
+/// 向外部（Runner）推送一条剪贴板文本更新通知。
+pub fn notify_clipboard_text(text: &str) {
     let (cb, user_data) = {
-        let Ok(guard) = SESSION_EVENT_CALLBACK.lock() else {
+        let Ok(guard) = CLIPBOARD_CALLBACK.lock() else {
             return;
         };
         (guard.callback, guard.user_data as *mut c_void)
     };
 
     if let Some(callback) = cb {
-        callback(
-            user_data,
-            session_id.as_ptr(),
-            session_id.len(),
-            event_json.as_ptr(),
-            event_json.len(),
-        );
+        let bytes = text.as_bytes();
+        callback(user_data, bytes.as_ptr(), bytes.len());
     }
 }
-
-/// 向外部（Runner）推送一条 Rust tracing 日志。
-///
-/// `level` 与 `message` 要求为 UTF-8 文本。
-pub fn notify_rust_log(level: &str, message: &str) {
-    let (cb, user_data) = {
-        let Ok(guard) = RUST_LOG_CALLBACK.lock() else {
-            return;
-        };
-        (guard.callback, guard.user_data as *mut c_void)
-    };
-
-    if let Some(callback) = cb {
-        callback(
-            user_data,
-            level.as_ptr(),
-            level.len(),
-            message.as_ptr(),
-            message.len(),
-        );
-    }
-}
-
-
