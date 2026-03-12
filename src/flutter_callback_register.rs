@@ -52,6 +52,19 @@ type SessionEventCallback = extern "C" fn(
     event_json_len: usize,
 );
 
+/// RustLog 回调：推送 Rust tracing 日志。
+///
+/// 参数约定：
+/// - level/level_len: 日志级别文本（UTF-8，如 INFO/WARN/ERROR）；
+/// - message/message_len: 日志正文（UTF-8）。
+type RustLogCallback = extern "C" fn(
+    user_data: *mut c_void,
+    level: *const u8,
+    level_len: usize,
+    message: *const u8,
+    message_len: usize,
+);
+
 #[derive(Clone, Copy)]
 struct V2CallbackHolder {
     callback: Option<V2FrameCallback>,
@@ -89,6 +102,20 @@ struct SessionEventCallbackHolder {
 
 static SESSION_EVENT_CALLBACK: Lazy<Mutex<SessionEventCallbackHolder>> = Lazy::new(|| {
     Mutex::new(SessionEventCallbackHolder {
+        callback: None,
+        user_data: 0,
+    })
+});
+
+#[derive(Clone, Copy)]
+struct RustLogCallbackHolder {
+    callback: Option<RustLogCallback>,
+    /// 由调用方透传的上下文指针（C++ Runner 实例）。
+    user_data: usize,
+}
+
+static RUST_LOG_CALLBACK: Lazy<Mutex<RustLogCallbackHolder>> = Lazy::new(|| {
+    Mutex::new(RustLogCallbackHolder {
         callback: None,
         user_data: 0,
     })
@@ -139,6 +166,22 @@ pub extern "C" fn rs_register_session_event_callback(
     user_data: *mut c_void,
 ) -> bool {
     let Ok(mut guard) = SESSION_EVENT_CALLBACK.lock() else {
+        return false;
+    };
+    guard.callback = callback;
+    guard.user_data = user_data as usize;
+    true
+}
+
+/// 注册 RustLog 回调（由 Windows Runner 调用一次）。
+///
+/// 回调触发线程：Rust 运行时线程（tracing 产生日志时）。
+#[no_mangle]
+pub extern "C" fn rs_register_rust_log_callback(
+    callback: Option<RustLogCallback>,
+    user_data: *mut c_void,
+) -> bool {
+    let Ok(mut guard) = RUST_LOG_CALLBACK.lock() else {
         return false;
     };
     guard.callback = callback;
@@ -220,6 +263,28 @@ pub fn notify_session_event(session_id: &str, event_json: &[u8]) {
             session_id.len(),
             event_json.as_ptr(),
             event_json.len(),
+        );
+    }
+}
+
+/// 向外部（Runner）推送一条 Rust tracing 日志。
+///
+/// `level` 与 `message` 要求为 UTF-8 文本。
+pub fn notify_rust_log(level: &str, message: &str) {
+    let (cb, user_data) = {
+        let Ok(guard) = RUST_LOG_CALLBACK.lock() else {
+            return;
+        };
+        (guard.callback, guard.user_data as *mut c_void)
+    };
+
+    if let Some(callback) = cb {
+        callback(
+            user_data,
+            level.as_ptr(),
+            level.len(),
+            message.as_ptr(),
+            message.len(),
         );
     }
 }

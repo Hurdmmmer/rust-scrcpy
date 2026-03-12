@@ -15,8 +15,11 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use tokio::process::Command;
-use tracing::{info, warn, Level};
+use tracing::{Event, Level, Subscriber, info, warn};
+use tracing::field::{Field, Visit};
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, layer::SubscriberExt, registry::LookupSpan};
+use tracing_subscriber::filter::LevelFilter;
 
 
 use crate::flutter_callback_register;
@@ -57,6 +60,53 @@ static API_SESSIONS: Lazy<Mutex<HashMap<String, ApiSession>>> =
 /// tracing subscriber 在同一进程里只能初始化一次，
 /// 这里用布尔位保证 `setup_logger` 幂等。
 static LOGGER_READY: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
+/// tracing 字段访问器：将事件字段拼接成文本，便于回传到 Flutter 日志面板。
+struct FlutterLogVisitor {
+    fields: Vec<String>,
+}
+
+impl FlutterLogVisitor {
+    /// 输出字段文本（`key=value`，逗号分隔）。
+    fn as_text(&self) -> String {
+        self.fields.join(", ")
+    }
+}
+
+impl Visit for FlutterLogVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields.push(format!("{}={:?}", field.name(), value));
+    }
+}
+
+/// tracing -> Flutter 日志桥接层。
+///
+/// 作用：
+/// - 监听每条 tracing event；
+/// - 抽取 level/target/fields；
+/// - 通过 `flutter_callback_register::notify_rust_log` 推送到 Runner。
+struct FlutterLogLayer;
+
+impl<S> Layer<S> for FlutterLogLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let meta = event.metadata();
+        let mut visitor = FlutterLogVisitor { fields: Vec::new() };
+        event.record(&mut visitor);
+        let fields_text = visitor.as_text();
+        let message = if fields_text.is_empty() {
+            format!("target={}", meta.target())
+        } else {
+            format!("target={} {}", meta.target(), fields_text)
+        };
+        crate::flutter_callback_register::notify_rust_log(
+            &meta.level().to_string(),
+            &message,
+        );
+    }
+}
 
 /// 后台 worker 控制命令。
 ///
@@ -627,14 +677,12 @@ pub async fn setup_logger(max_level: LogLevel) -> Result<()> {
     }
 
     let level = map_level(max_level);
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_ansi(false)
-        .finish()
+    // 仅安装 FlutterLogLayer：
+    // - 统一把 Rust 日志回传到 Flutter 日志面板；
+    // - 避免 stdout 与 Flutter 面板双份输出造成刷屏和诊断噪音。
+    tracing_subscriber::registry()
+        .with(LevelFilter::from_level(level))
+        .with(FlutterLogLayer)
         .try_init()
         .map_err(|e| ScrcpyError::Other(format!("setup logger failed: {}", e)))?;
 
