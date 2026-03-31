@@ -8,3 +8,4 @@ pub(crate) mod flutter_callback_register;
 pub mod gh_api;
 pub mod gh_common;
 pub mod scrcpy;
+pub mod yolo;

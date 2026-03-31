@@ -246,3 +246,76 @@ pub struct ScrollEvent {
     pub hscroll: i32,
     pub vscroll: i32,
 }
+
+/// YOLO 推理执行后端（仅硬件后端，不允许 CPU 推理）。
+#[frb(unignore)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum YoloExecutionProvider {
+    /// Windows DirectML（兼容 NVIDIA/AMD/Intel）。
+    DirectMl,
+    /// NVIDIA CUDA（依赖 CUDA 环境）。
+    Cuda,
+    /// NVIDIA TensorRT（高性能，部署要求更高）。
+    TensorRt,
+}
+
+/// YOLO 推理配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YoloConfig {
+    /// ONNX 模型绝对路径。
+    pub model_path: String,
+    /// 网络输入宽度（例如 640）。
+    pub input_width: u32,
+    /// 网络输入高度（例如 640）。
+    pub input_height: u32,
+    /// 置信度阈值。
+    pub confidence_threshold: f32,
+    /// NMS IoU 阈值。
+    pub iou_threshold: f32,
+    /// 每帧最大检测框数量。
+    pub max_detections: u32,
+    /// 推理后端（仅硬件后端）。
+    pub provider: YoloExecutionProvider,
+    /// 可选设备索引（CUDA/TensorRT 场景可用）。
+    pub device_index: Option<u32>,
+    /// 推理限频（每秒最多处理多少帧）。
+    pub max_infer_fps: u32,
+}
+
+/// 单个检测框结果。
+#[frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YoloDetection {
+    /// 类别 ID。
+    pub class_id: u32,
+    /// 类别名称（可选）。
+    pub label: Option<String>,
+    /// 置信度分数。
+    pub score: f32,
+    /// 左上角 x（像素坐标）。
+    pub x: f32,
+    /// 左上角 y（像素坐标）。
+    pub y: f32,
+    /// 宽度（像素）。
+    pub width: f32,
+    /// 高度（像素）。
+    pub height: f32,
+}
+
+/// 单帧 YOLO 推理结果事件。
+#[frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YoloFrameResult {
+    /// 关联会话 ID。
+    pub session_id: String,
+    /// 视频帧 ID。
+    pub frame_id: u64,
+    /// 原始帧宽度。
+    pub frame_width: u32,
+    /// 原始帧高度。
+    pub frame_height: u32,
+    /// 推理耗时（毫秒）。
+    pub infer_latency_ms: u32,
+    /// 检测框列表。
+    pub detections: Vec<YoloDetection>,
+}

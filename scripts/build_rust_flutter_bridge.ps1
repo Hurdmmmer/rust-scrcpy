@@ -59,6 +59,40 @@ try {
 
     $BuiltDll = Join-Path $RustRoot "target\release\rust_scrcpy.dll"
     $DstDll = Join-Path $FlutterRoot "lib\platforms\windows\third_sdk\rust_scrcpy.dll"
+    $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vsWhere)) {
+        throw "vswhere.exe not found: $vsWhere"
+    }
+    $vsInstall = (& $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+    if ([string]::IsNullOrWhiteSpace($vsInstall)) {
+        throw "Visual Studio C++ Build Tools not found"
+    }
+    $msvcRoot = Join-Path $vsInstall "VC\Tools\MSVC"
+    $msvcVerDir = Get-ChildItem $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if ($null -eq $msvcVerDir) {
+        throw "MSVC tools directory not found: $msvcRoot"
+    }
+    $msvcInclude = Join-Path $msvcVerDir.FullName "include"
+    $winKitRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
+    $winKitVerDir = Get-ChildItem $winKitRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if ($null -eq $winKitVerDir) {
+        throw "Windows SDK include directory not found: $winKitRoot"
+    }
+    $sdkBase = $winKitVerDir.FullName
+    $sdkIncludes = @(
+        (Join-Path $sdkBase "ucrt"),
+        (Join-Path $sdkBase "um"),
+        (Join-Path $sdkBase "shared"),
+        (Join-Path $sdkBase "winrt"),
+        (Join-Path $sdkBase "cppwinrt")
+    )
+    $bindgenIncludeArgs = @("-isystem", "`"$msvcInclude`"")
+    foreach ($inc in $sdkIncludes) {
+        if (Test-Path $inc) {
+            $bindgenIncludeArgs += @("-isystem", "`"$inc`"")
+        }
+    }
+    $env:BINDGEN_EXTRA_CLANG_ARGS = ($bindgenIncludeArgs -join " ")
 
     Write-Log "Rust 工程目录：$RustRoot"
     Write-Log "Flutter 工程目录：$FlutterRoot"

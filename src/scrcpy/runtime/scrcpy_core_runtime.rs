@@ -9,6 +9,7 @@ use crate::scrcpy::runtime::scrcpy_decode_pipeline::{
     DecodeFrame, ScrcpyDecodeConfig, ScrcpyDecodeEvent, ScrcpyDecodePipeline,
 };
 use crate::scrcpy::session::SessionManager;
+use crate::yolo::service::yolo_service;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -240,6 +241,16 @@ impl ScrcpyCoreRuntime {
                     height,
                     pts,
                 } => {
+                    // 为 YOLO 生成独立帧序号，提交共享纹理句柄任务。
+                    let frame_id = flutter_callback_register::next_frame_id();
+                    if let Err(e) = yolo_service::infer_and_publish_gpu_frame(
+                        session_id, frame_id, *handle, *width, *height,
+                    ) {
+                        warn!(
+                            "[核心运行时] YOLO GPU任务提交失败：session_id={}, frame_id={}, handle={}, err={}",
+                            session_id, frame_id, *handle, e
+                        );
+                    }
                     // V1 回调：共享句柄元信息。
                     flutter_callback_register::notify_v1_frame(
                         *handle,
@@ -253,6 +264,20 @@ impl ScrcpyCoreRuntime {
                 DecodedFrame::CpuBgra(cpu) => {
                     // V2 回调：CPU 像素数据。
                     let frame_id = flutter_callback_register::next_frame_id();
+                    // YOLO 推理：直接复用解码后的 BGRA 数据，避免额外拷贝链路。
+                    if let Err(e) = yolo_service::infer_and_publish_frame(
+                        session_id,
+                        frame_id,
+                        &cpu.data,
+                        cpu.width,
+                        cpu.height,
+                        cpu.width.saturating_mul(4),
+                    ) {
+                        warn!(
+                            "[核心运行时] YOLO 推理失败：session_id={}, frame_id={}, err={}",
+                            session_id, frame_id, e
+                        );
+                    }
                     let rgba = Self::bgra_to_rgba(&cpu.data);
                     flutter_callback_register::notify_v2_frame_raw(
                         frame_id,
@@ -426,6 +451,7 @@ impl ScrcpyCoreRuntime {
         self.decoded_frames.remove(session_id);
         self.decode_events.remove(session_id);
         self.perf_states.remove(session_id);
+        yolo_service::remove_session_state(session_id);
 
         info!("[核心运行时] 会话停止成功: session_id={}", session_id);
         Ok(())

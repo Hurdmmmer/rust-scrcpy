@@ -8,7 +8,7 @@
 pub use crate::gh_common::model::{
     DecoderMode, DeviceInfo, LogEvent, LogLevel, OrientationChangeSource, OrientationMode,
     RenderPipelineMode, SessionConfig, SessionConfigV2, SessionEvent, SessionStats, SystemKey,
-    TextureFrame,
+    TextureFrame, YoloConfig, YoloExecutionProvider, YoloFrameResult,
 };
 
 use crate::frb_generated::StreamSink;
@@ -150,4 +150,41 @@ pub async fn subscribe_clipboard_events(
 /// - 调用方取消 Dart 订阅后，Rust 转发线程会自动退出。
 pub async fn subscribe_logs(sink: StreamSink<LogEvent>) -> Result<()> {
     session_service::subscribe_logs(sink).await
+}
+
+/// 初始化 YOLO 推理配置（仅硬件后端）。
+///
+/// 参数：
+/// - `config`：初始推理配置（模型路径、输入尺寸、阈值、后端）。
+pub async fn init_yolo(config: YoloConfig) -> Result<()> {
+    crate::yolo::service::yolo_service::init_yolo(config).await
+}
+
+/// 运行中更新 YOLO 推理配置（实时生效）。
+///
+/// 参数：
+/// - `config`：新的推理配置（模型路径、输入尺寸、阈值、后端）。
+pub async fn update_yolo_config(config: YoloConfig) -> Result<()> {
+    crate::yolo::service::yolo_service::update_yolo_config(config).await
+}
+
+/// 设置会话级 YOLO 开关。
+///
+/// 参数：
+/// - `session_id`：目标会话 ID；
+/// - `enabled`：`true` 启用，`false` 关闭。
+pub async fn set_yolo_enabled(session_id: String, enabled: bool) -> Result<()> {
+    crate::yolo::service::yolo_service::set_yolo_enabled(session_id, enabled).await
+}
+
+/// 订阅会话级 YOLO 结果流。
+///
+/// 参数：
+/// - `session_id`：目标会话 ID；
+/// - `sink`：FRB 结果流下沉通道。
+pub async fn subscribe_yolo_results(
+    session_id: String,
+    sink: StreamSink<YoloFrameResult>,
+) -> Result<()> {
+    crate::yolo::service::yolo_service::subscribe_yolo_results(session_id, sink).await
 }

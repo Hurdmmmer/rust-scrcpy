@@ -107,7 +107,7 @@ impl Visit for LogEventVisitor {
 }
 
 /// tracing 事件转发层：把 Rust 日志广播到 FRB 日志流。
-struct LogBroadcastLayer;
+struct LogBroadcastLayer {}
 
 impl<S> Layer<S> for LogBroadcastLayer
 where
@@ -676,10 +676,26 @@ fn spawn_runtime_worker(
                     pump_result = runtime.decode_pump_once(&session_id_c) => {
                         if let Err(e) = pump_result {
                             warn!(
-                                "[新服务] 解码泵送失败，结束会话: session_id={}, err={}",
+                                "[新服务] 解码泵送失败，尝试主动重连: session_id={}, err={}",
                                 session_id_c, e
                             );
-                            running_c.store(false, Ordering::Relaxed);
+                            let _ = runtime.stop(&session_id_c).await;
+                            tokio::time::sleep(Duration::from_millis(120)).await;
+                            match runtime.start(session_id_c.clone()).await {
+                                Ok(_) => {
+                                    info!(
+                                        "[新服务] 主动重连成功，连接已补上: session_id={}",
+                                        session_id_c
+                                    );
+                                }
+                                Err(reconnect_err) => {
+                                    warn!(
+                                        "[新服务] 主动重连失败，结束会话: session_id={}, err={}",
+                                        session_id_c, reconnect_err
+                                    );
+                                    running_c.store(false, Ordering::Relaxed);
+                                }
+                            }
                         }
                     }
                 }
@@ -715,6 +731,11 @@ fn spawn_runtime_worker(
                         );
                         running_c.store(false, Ordering::Relaxed);
                         break;
+                    } else {
+                        info!(
+                            "[新服务] 自动重连成功，连接已补上: session_id={}",
+                            session_id_c
+                        );
                     }
                 }
 
@@ -771,7 +792,7 @@ pub async fn setup_logger(max_level: LogLevel) -> Result<()> {
     tracing_subscriber::registry()
         .with(LevelFilter::from_level(level))
         .with(fmt::layer().with_target(true))
-        .with(LogBroadcastLayer)
+        .with(LogBroadcastLayer {})
         .try_init()
         .map_err(|e| ScrcpyError::Other(format!("setup logger failed: {}", e)))?;
 

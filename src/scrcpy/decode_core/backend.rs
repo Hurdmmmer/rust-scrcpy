@@ -1,6 +1,8 @@
-use crate::scrcpy::decode_core::ffmpeg_decoder::{BgraFrame, FfmpegDecoder, FfmpegDecoderMode};
-use crate::scrcpy::decode_core::gpu_direct_output::{D3D11Context, D3D11TextureUploader};
 use crate::gh_common::{Result, ScrcpyError};
+use crate::scrcpy::decode_core::ffmpeg_decoder::{
+    BgraFrame, FfmpegDecodedFrame, FfmpegDecoder, FfmpegDecoderMode,
+};
+use crate::scrcpy::decode_core::gpu_direct_output::{D3D11Context, D3D11TextureUploader};
 use tracing::{debug, info, warn};
 
 /// 对外统一的解码输出。
@@ -101,12 +103,37 @@ impl VideoDecoder for SoftwareDecoder {
     fn decode(&mut self, packet: &[u8]) -> Result<Vec<DecodedFrame>> {
         debug!("software decode input bytes={}", packet.len());
         let frames = self.inner.decode(packet)?;
-        self.stats.decoded_frames = self.stats.decoded_frames.saturating_add(frames.len() as u64);
+        self.stats.decoded_frames = self
+            .stats
+            .decoded_frames
+            .saturating_add(frames.len() as u64);
         debug!("software decode output frames={}", frames.len());
         let mut out = Vec::with_capacity(frames.len());
         for frame in frames {
-            match self.output_mode {
-                DecoderOutputMode::GpuShared => {
+            match (self.output_mode, frame) {
+                // 条件：解码器已经直接产出 GPU 共享句柄帧。
+                // 处理：直接透传到上层输出，跳过 upload_bgra_frame。
+                // 价值：避免重复拷贝，降低 CPU 与上传延迟。
+                (
+                    DecoderOutputMode::GpuShared,
+                    FfmpegDecodedFrame::GpuShared {
+                        handle,
+                        width,
+                        height,
+                        pts,
+                    },
+                ) => {
+                    out.push(DecodedFrame::GpuShared {
+                        handle,
+                        width,
+                        height,
+                        pts,
+                    });
+                }
+                // 条件：当前是软件解码，且输出模式要求 GpuShared。
+                // 处理：执行 CPU BGRA -> GPU 共享纹理上传，生成可渲染句柄。
+                // 说明：这是软件解码兼容现有 V1 渲染链路的必经分支。
+                (DecoderOutputMode::GpuShared, FfmpegDecodedFrame::CpuBgra(frame)) => {
                     let uploader = self.uploader.as_mut().ok_or_else(|| {
                         ScrcpyError::Decode("software uploader unavailable".to_string())
                     })?;
@@ -122,7 +149,16 @@ impl VideoDecoder for SoftwareDecoder {
                         pts: frame.pts,
                     });
                 }
-                DecoderOutputMode::CpuBgra => out.push(DecodedFrame::CpuBgra(frame)),
+                (DecoderOutputMode::CpuBgra, FfmpegDecodedFrame::CpuBgra(frame)) => {
+                    out.push(DecodedFrame::CpuBgra(frame))
+                }
+                // 条件：上层要求 CpuBgra，但底层却返回了 GpuShared。
+                // 处理：直接返回错误，避免静默吞帧导致状态不可观测。
+                (DecoderOutputMode::CpuBgra, FfmpegDecodedFrame::GpuShared { .. }) => {
+                    return Err(ScrcpyError::Decode(
+                        "received GPU frame in CpuBgra mode".to_string(),
+                    ));
+                }
             }
         }
         Ok(out)
@@ -167,7 +203,10 @@ impl HardwareDecoderStub {
             }
             DecoderOutputMode::CpuBgra => None,
         };
-        info!("hardware decoder initialized, output_mode={:?}", output_mode);
+        info!(
+            "hardware decoder initialized, output_mode={:?}",
+            output_mode
+        );
         Ok(Self {
             inner,
             uploader,
@@ -185,12 +224,36 @@ impl VideoDecoder for HardwareDecoderStub {
     fn decode(&mut self, packet: &[u8]) -> Result<Vec<DecodedFrame>> {
         debug!("hardware decode input bytes={}", packet.len());
         let frames = self.inner.decode(packet)?;
-        self.stats.decoded_frames = self.stats.decoded_frames.saturating_add(frames.len() as u64);
+        self.stats.decoded_frames = self
+            .stats
+            .decoded_frames
+            .saturating_add(frames.len() as u64);
         debug!("hardware decode output frames={}", frames.len());
         let mut out = Vec::with_capacity(frames.len());
         for frame in frames {
-            match self.output_mode {
-                DecoderOutputMode::GpuShared => {
+            match (self.output_mode, frame) {
+                // 条件：硬件解码路径已直接得到 GPU 共享句柄。
+                // 处理：直接透传输出，不再走 upload_bgra_frame。
+                // 价值：去掉 CPU->GPU 回传步骤，减少链路开销。
+                (
+                    DecoderOutputMode::GpuShared,
+                    FfmpegDecodedFrame::GpuShared {
+                        handle,
+                        width,
+                        height,
+                        pts,
+                    },
+                ) => {
+                    out.push(DecodedFrame::GpuShared {
+                        handle,
+                        width,
+                        height,
+                        pts,
+                    });
+                }
+                // 条件：当前帧仍为 CpuBgra（直出未命中或回退）。
+                // 处理：走上传器将 BGRA 写入共享纹理，保证功能可用。
+                (DecoderOutputMode::GpuShared, FfmpegDecodedFrame::CpuBgra(frame)) => {
                     let uploader = self.uploader.as_mut().ok_or_else(|| {
                         ScrcpyError::Decode("hardware uploader unavailable".to_string())
                     })?;
@@ -206,7 +269,14 @@ impl VideoDecoder for HardwareDecoderStub {
                         pts: frame.pts,
                     });
                 }
-                DecoderOutputMode::CpuBgra => out.push(DecodedFrame::CpuBgra(frame)),
+                (DecoderOutputMode::CpuBgra, FfmpegDecodedFrame::CpuBgra(frame)) => {
+                    out.push(DecodedFrame::CpuBgra(frame))
+                }
+                (DecoderOutputMode::CpuBgra, FfmpegDecodedFrame::GpuShared { .. }) => {
+                    return Err(ScrcpyError::Decode(
+                        "received GPU frame in CpuBgra mode".to_string(),
+                    ));
+                }
             }
         }
         Ok(out)
@@ -267,9 +337,3 @@ impl DecoderFactory {
         }
     }
 }
-
-
-
-
-
-

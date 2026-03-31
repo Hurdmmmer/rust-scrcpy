@@ -1,5 +1,11 @@
 use crate::gh_common::{Result, ScrcpyError};
 use tracing::{debug, info, warn};
+#[cfg(target_os = "windows")]
+use windows::core::Interface;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dxgi::IDXGIResource;
 
 /// 硬解调试常量：指定具体硬解名称（`None` 表示自动探测）。
 /// 是否禁用 `h264_cuvid`（默认不禁用）。
@@ -26,6 +32,25 @@ pub struct BgraFrame {
     pub pts: i64,
 }
 
+/// 解码器输出帧抽象。
+///
+/// 设计目的：
+/// - 为“解码直接输出 GPU 资源”预留统一出口；
+/// - 现阶段保持与历史行为一致，默认仍输出 `CpuBgra`；
+/// - 后续接入 D3D11VA 直出时，仅需新增 `GpuShared` 生产逻辑，backend 无需再改签名。
+#[derive(Clone, Debug)]
+pub enum FfmpegDecodedFrame {
+    /// CPU BGRA 像素帧（当前主路径）。
+    CpuBgra(BgraFrame),
+    /// GPU 共享纹理句柄帧。
+    GpuShared {
+        handle: i64,
+        width: u32,
+        height: u32,
+        pts: i64,
+    },
+}
+
 /// FFmpeg H.264 解码器（可选硬解，失败自动回落软解）。
 ///
 /// 设计目标：
@@ -40,6 +65,8 @@ pub struct FfmpegDecoder {
     scaler_src_format: Option<ffmpeg_next::format::Pixel>,
     frame_count: u64,
     packet_buf: Vec<u8>,
+    /// 是否已经打印过“硬件帧直出失败”告警，避免每帧刷屏。
+    direct_gpu_export_warned: bool,
 }
 
 impl FfmpegDecoder {
@@ -64,10 +91,11 @@ impl FfmpegDecoder {
     /// - `ForceHw`：仅硬解；
     /// - `ForceSw`：仅软解。
     pub fn new_with_mode(mode: FfmpegDecoderMode) -> Result<Self> {
-        ffmpeg_next::init().map_err(|e| ScrcpyError::Decode(format!("FFmpeg init failed: {}", e)))?;
+        ffmpeg_next::init()
+            .map_err(|e| ScrcpyError::Decode(format!("FFmpeg init failed: {}", e)))?;
         info!("FFmpeg initialized");
         info!("Decoder mode: {:?}", mode);
-        
+
         let requested_hw_decoder: Option<String> = None;
 
         // 按优先级探测可用硬解。注意：这里只能说明“可被发现”，
@@ -97,7 +125,6 @@ impl FfmpegDecoder {
 
             if codec.is_none() {
                 for (hw_name, hw_desc) in &hw_decoders {
-                    
                     if let Some(hw_codec) = ffmpeg_next::codec::decoder::find_by_name(hw_name) {
                         info!("Found hw decoder: {} ({})", hw_name, hw_desc);
                         codec = Some(hw_codec);
@@ -157,7 +184,55 @@ impl FfmpegDecoder {
             scaler_src_format: None,
             frame_count: 0,
             packet_buf: Vec::with_capacity(1024 * 1024),
+            direct_gpu_export_warned: false,
         })
+    }
+
+    /// 尝试从硬件帧中直接提取 D3D11 共享句柄（Windows）。
+    ///
+    /// 说明：
+    /// - 仅当 FFmpeg 输出为 D3D11 硬件像素格式时尝试；
+    /// - 成功则可直接走 `GpuShared`，跳过 `BGRA -> upload`；
+    /// - 失败时回退到 CPU BGRA 路径，保证功能可用。
+    #[cfg(target_os = "windows")]
+    fn try_extract_d3d11_shared_handle(
+        &mut self,
+        frame: &ffmpeg_next::util::frame::Video,
+    ) -> Option<(i64, u32, u32, i64)> {
+        use ffmpeg_next::format::Pixel;
+        let fmt = frame.format();
+        if fmt != Pixel::D3D11VA_VLD && fmt != Pixel::D3D11 {
+            return None;
+        }
+
+        let (width, height, pts) = (frame.width(), frame.height(), frame.pts().unwrap_or(0));
+        unsafe {
+            let av = frame.as_ptr();
+            let raw_texture_ptr = (*av).data[0] as *mut core::ffi::c_void;
+            if raw_texture_ptr.is_null() {
+                return None;
+            }
+
+            let tex = ID3D11Texture2D::from_raw_borrowed(&raw_texture_ptr)?;
+            let dxgi_res: IDXGIResource = match tex.cast() {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let handle = match dxgi_res.GetSharedHandle() {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            Some((handle.0 as i64, width, height, pts))
+        }
+    }
+
+    /// 非 Windows 平台占位实现：始终不走 D3D11 直出。
+    #[cfg(not(target_os = "windows"))]
+    fn try_extract_d3d11_shared_handle(
+        &mut self,
+        _frame: &ffmpeg_next::util::frame::Video,
+    ) -> Option<(i64, u32, u32, i64)> {
+        None
     }
 
     /// 解码一个 Annex-B 包。
@@ -166,8 +241,8 @@ impl FfmpegDecoder {
     /// 1) 单个不带起始码的 NAL；
     /// 2) 已带起始码的 Annex-B 字节流（可包含多个 NAL）。
     ///
-    /// 返回该包产出的 0..N 帧。
-    pub fn decode(&mut self, packet_data: &[u8]) -> Result<Vec<BgraFrame>> {
+    /// 返回该包产出的 0..N 帧（支持 CPU/GPU 双形态）。
+    pub fn decode(&mut self, packet_data: &[u8]) -> Result<Vec<FfmpegDecodedFrame>> {
         if packet_data.is_empty() {
             return Ok(Vec::new());
         }
@@ -227,16 +302,47 @@ impl FfmpegDecoder {
             match self.decoder.receive_frame(&mut decoded_frame) {
                 Ok(_) => {
                     self.frame_count += 1;
+                    if let Some((handle, width, height, pts)) =
+                        self.try_extract_d3d11_shared_handle(&decoded_frame)
+                    {
+                        debug!(
+                            "decode direct gpu frame: format={:?}, handle={}, {}x{}, pts={}",
+                            decoded_frame.format(),
+                            handle,
+                            width,
+                            height,
+                            pts
+                        );
+                        outputs.push(FfmpegDecodedFrame::GpuShared {
+                            handle,
+                            width,
+                            height,
+                            pts,
+                        });
+                        continue;   
+                    }
+
+                    if matches!(
+                        decoded_frame.format(),
+                        ffmpeg_next::format::Pixel::D3D11VA_VLD | ffmpeg_next::format::Pixel::D3D11
+                    ) && !self.direct_gpu_export_warned
+                    {
+                        self.direct_gpu_export_warned = true;
+                        warn!(
+                            "hardware frame direct export unavailable, fallback to CPU BGRA path"
+                        );
+                    }
+
                     let width = decoded_frame.width();
                     let height = decoded_frame.height();
                     let pts = decoded_frame.pts().unwrap_or(0);
                     let bgra_data = self.convert_to_bgra(&decoded_frame)?;
-                    outputs.push(BgraFrame {
+                    outputs.push(FfmpegDecodedFrame::CpuBgra(BgraFrame {
                         data: bgra_data,
                         width,
                         height,
                         pts,
-                    });
+                    }));
                 }
                 // EAGAIN：当前包可取的帧已经取完。
                 Err(ffmpeg_next::Error::Other { errno: 11 }) => break,
@@ -315,7 +421,3 @@ impl Drop for FfmpegDecoder {
         );
     }
 }
-
-
-
-
